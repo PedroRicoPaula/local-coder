@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "context-compressor": {
+      "command": "~/.cargo/bin/context-compressor-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
