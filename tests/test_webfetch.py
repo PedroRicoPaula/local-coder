@@ -20,7 +20,14 @@ class TestApplyFetch(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_declined_fetch_returns_none(self):
-        with mock.patch("builtins.input", return_value="n"):
+        with mock.patch("webfetch.is_online", return_value=True), \
+             mock.patch("builtins.input", return_value="n"):
+            result = webfetch.apply_fetch("https://example.com", confirm=True)
+        self.assertIsNone(result)
+
+    def test_offline_skips_without_prompting(self):
+        with mock.patch("webfetch.is_online", return_value=False), \
+             mock.patch("builtins.input", side_effect=AssertionError("should never prompt")):
             result = webfetch.apply_fetch("https://example.com", confirm=True)
         self.assertIsNone(result)
 

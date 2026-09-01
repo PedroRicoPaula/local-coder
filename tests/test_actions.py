@@ -56,6 +56,18 @@ class TestExtraction(unittest.TestCase):
         text = "```shell\nls -la\n```"
         self.assertEqual(actions.extract_shell_suggestions(text), ["ls -la"])
 
+    def test_extract_search(self):
+        text = "```search:python asyncio timeout\n```"
+        self.assertEqual(actions.extract_searches(text), ["python asyncio timeout"])
+
+    def test_extract_symbol_request(self):
+        text = "```symbol:src/util.py#parse_config\n```"
+        self.assertEqual(actions.extract_symbol_requests(text), [("src/util.py", "parse_config")])
+
+    def test_extract_symbol_request_malformed_skipped(self):
+        text = "```symbol:src/util.py\n```"
+        self.assertEqual(actions.extract_symbol_requests(text), [])
+
     def test_strip_action_blocks_leaves_readable_prose(self):
         text = "Adding a function.\n```write:a.py\ndef f(): pass\n```\nDone."
         prose = actions.strip_action_blocks(text)

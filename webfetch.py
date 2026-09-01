@@ -15,6 +15,9 @@ import urllib.error
 import urllib.request
 from html.parser import HTMLParser
 
+import ui
+from websearch import is_online
+
 MAX_BYTES = 500_000
 MAX_TEXT_CHARS = 8000
 TIMEOUT_S = 10
@@ -51,13 +54,16 @@ def apply_fetch(url: str, confirm: bool = True) -> str | None:
     """Returns extracted page text to feed back to the model, or None if
     refused/skipped/failed (nothing to feed back)."""
     if not (url.startswith("http://") or url.startswith("https://")):
-        print(f"  [security] refusing to fetch non-http(s) URL: {url}")
+        ui.error(f"refusing to fetch non-http(s) URL: {url}")
+        return None
+
+    if not is_online():
+        ui.sub("offline -- skipping fetch (no confirmation needed for something guaranteed to fail)")
         return None
 
     if confirm:
-        answer = input(f"  fetch {url}? [y/N] ").strip().lower()
-        if answer != "y":
-            print("  skipped")
+        if not ui.confirm(f"  fetch {url}?"):
+            ui.sub("skipped")
             return None
 
     req = urllib.request.Request(url, headers={"User-Agent": "localcoder/1.0"})
@@ -66,12 +72,12 @@ def apply_fetch(url: str, confirm: bool = True) -> str | None:
             raw = resp.read(MAX_BYTES)
             charset = resp.headers.get_content_charset() or "utf-8"
     except (urllib.error.URLError, OSError) as e:
-        print(f"  could not fetch {url}: {e}")
+        ui.sub(f"could not fetch {url}: {e}")
         return None
 
     html = raw.decode(charset, errors="replace")
     text = _html_to_text(html)
     if len(text) > MAX_TEXT_CHARS:
         text = text[:MAX_TEXT_CHARS] + "\n...(truncated)"
-    print(f"  fetched {url} ({len(text)} chars of extracted text)")
+    ui.sub(f"fetched {url} ({len(text)} chars of extracted text)")
     return f"Content of {url}:\n{text}"

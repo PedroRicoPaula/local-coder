@@ -54,6 +54,13 @@ class MCPClient:
                 self._proc.kill()
         self._proc = None
 
+    def is_alive(self) -> bool:
+        """Cheap, non-blocking liveness check -- unlike `tools` being
+        populated at start(), this reflects whether the subprocess is still
+        actually running right now, so a mid-session crash can be detected
+        instead of assumed away."""
+        return self._proc is not None and self._proc.poll() is None
+
     def call_tool(self, name: str, arguments: dict) -> dict:
         result = self._call("tools/call", {"name": name, "arguments": arguments})
         return result

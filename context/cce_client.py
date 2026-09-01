@@ -42,6 +42,23 @@ class CCEClient:
     def available(self) -> bool:
         return self._client is not None
 
+    def is_alive(self) -> bool:
+        """Unlike `available` (only checks whether a client was ever
+        constructed), this checks whether the CCE subprocess is actually
+        still running -- catches a mid-session crash instead of continuing
+        to report "available" forever after start()."""
+        return self._client is not None and self._client.is_alive()
+
+    @property
+    def tool_names(self) -> list[str]:
+        """Diagnostic/future-proofing: today CCE only ever advertises
+        compress_file and get_symbol, but if a future version adds a
+        generic text-compression tool, this lets callers detect it instead
+        of the code assuming forever that only two tools exist."""
+        if not self._client:
+            return []
+        return [t["name"] for t in self._client.tools]
+
     def compress_file(self, file_path: str, task_description: str = "") -> str | None:
         """Returns the compressed pack text, or None on any failure (caller
         should fall back to reading the raw file)."""

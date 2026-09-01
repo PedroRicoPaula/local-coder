@@ -5,7 +5,7 @@ over Ollama, qwen2.5-coder's tool_call output was found to be unreliable
 action uses a plain text convention the CLI parses itself -- deterministic
 either way, no dependency on the model correctly filling a JSON schema.
 
-Five block kinds, all using the same variable-length-fence convention (a
+Seven block kinds, all using the same variable-length-fence convention (a
 run of 3+ backticks, closed by the same count -- so a file whose own
 content has a ``` fence, e.g. a README with a code example, doesn't
 truncate the block: escalate to four+ backticks and the parser follows):
@@ -15,6 +15,8 @@ truncate the block: escalate to four+ backticks and the parser follows):
   ```run              -- execute a shell command (confirmed, output fed back)
   ```fetch:url          -- fetch a web page (confirmed, text fed back)
   ```shell             -- show a command WITHOUT running it (display only)
+  ```search:query       -- web search (confirmed, results fed back)
+  ```symbol:path#name   -- ask CCE for one elided function's full body
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gitsafety
+import ui
 from security import find_suspected_secrets
 
 WRITE_BLOCK_RE = re.compile(r"(`{3,})write:([^\n`]+)\n(.*?)\1", re.DOTALL)
@@ -30,6 +33,8 @@ DELETE_BLOCK_RE = re.compile(r"(`{3,})delete:([^\n`]+)\n?(.*?)\1", re.DOTALL)
 RUN_BLOCK_RE = re.compile(r"(`{3,})run\n(.*?)\1", re.DOTALL)
 FETCH_BLOCK_RE = re.compile(r"(`{3,})fetch:([^\n`]+)\n?(.*?)\1", re.DOTALL)
 SHELL_BLOCK_RE = re.compile(r"(`{3,})shell\n(.*?)\1", re.DOTALL)
+SEARCH_BLOCK_RE = re.compile(r"(`{3,})search:([^\n`]+)\n?(.*?)\1", re.DOTALL)
+SYMBOL_BLOCK_RE = re.compile(r"(`{3,})symbol:([^\n`]+)\n?(.*?)\1", re.DOTALL)
 
 
 @dataclass
@@ -61,6 +66,23 @@ def extract_shell_suggestions(model_output: str) -> list[str]:
     return [m.group(2).strip() for m in SHELL_BLOCK_RE.finditer(model_output)]
 
 
+def extract_searches(model_output: str) -> list[str]:
+    return [m.group(2).strip() for m in SEARCH_BLOCK_RE.finditer(model_output)]
+
+
+def extract_symbol_requests(model_output: str) -> list[tuple[str, str]]:
+    """Each ```symbol block must be `path#symbol_name` -- a spec with no
+    `#` is silently skipped (malformed, nothing sensible to act on)."""
+    out: list[tuple[str, str]] = []
+    for m in SYMBOL_BLOCK_RE.finditer(model_output):
+        spec = m.group(2).strip()
+        if "#" not in spec:
+            continue
+        path, _, name = spec.partition("#")
+        out.append((path.strip(), name.strip()))
+    return out
+
+
 def strip_action_blocks(model_output: str) -> str:
     """The prose the model wrote around the blocks, for display."""
     text = model_output
@@ -70,6 +92,8 @@ def strip_action_blocks(model_output: str) -> str:
         (RUN_BLOCK_RE, "command requested"),
         (FETCH_BLOCK_RE, "fetch requested"),
         (SHELL_BLOCK_RE, "shell suggestion"),
+        (SEARCH_BLOCK_RE, "search requested"),
+        (SYMBOL_BLOCK_RE, "symbol requested"),
     ):
         text = pattern.sub(f"[{label} -- see below]", text)
     return text.strip()
@@ -90,7 +114,7 @@ def _resolve_in_root(project_root: str, path: str) -> Path | None:
 def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bool:
     target = _resolve_in_root(project_root, write.path)
     if target is None:
-        print(f"[actions] refusing to write outside project root: {write.path}")
+        ui.error(f"refusing to write outside project root: {write.path}")
         return False
 
     existed = target.exists()
@@ -98,18 +122,17 @@ def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bo
 
     suspects = find_suspected_secrets(write.content)
     if suspects:
-        print(f"  [security] {write.path} contains something shaped like a secret: {suspects[0][:12]}...")
-        print("  [security] this is a pattern-match warning, not a certainty -- check before confirming.")
+        ui.warn(f"{write.path} contains something shaped like a secret: {suspects[0][:12]}...")
+        ui.warn("this is a pattern-match warning, not a certainty -- check before confirming.")
 
     if confirm:
-        answer = input(f"  {action} {write.path} ({len(write.content)} bytes)? [y/N] ").strip().lower()
-        if answer != "y":
-            print(f"  skipped {write.path}")
+        if not ui.confirm(f"  {action} {write.path} ({len(write.content)} bytes)?"):
+            ui.sub(f"skipped {write.path}")
             return False
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(write.content)
-    print(f"  {'wrote' if not existed else 'updated'} {write.path}")
+    ui.sub(f"{'wrote' if not existed else 'updated'} {write.path}")
     gitsafety.commit_change(project_root, f"write {write.path}")
     return True
 
@@ -117,22 +140,21 @@ def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bo
 def apply_delete(project_root: str, path: str, confirm: bool = True) -> bool:
     target = _resolve_in_root(project_root, path)
     if target is None:
-        print(f"[actions] refusing to delete outside project root: {path}")
+        ui.error(f"refusing to delete outside project root: {path}")
         return False
     if not target.exists():
-        print(f"  {path} doesn't exist, nothing to delete")
+        ui.sub(f"{path} doesn't exist, nothing to delete")
         return False
     if target.is_dir():
-        print(f"[actions] refusing to delete a directory ({path}) -- one file at a time")
+        ui.error(f"refusing to delete a directory ({path}) -- one file at a time")
         return False
 
     if confirm:
-        answer = input(f"  delete {path}? [y/N] ").strip().lower()
-        if answer != "y":
-            print(f"  skipped {path}")
+        if not ui.confirm(f"  delete {path}?"):
+            ui.sub(f"skipped {path}")
             return False
 
     target.unlink()
-    print(f"  deleted {path}")
+    ui.sub(f"deleted {path}")
     gitsafety.commit_change(project_root, f"delete {path}")
     return True
