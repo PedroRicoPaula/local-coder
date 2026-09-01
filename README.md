@@ -12,11 +12,18 @@ git clone https://github.com/PedroRicoPaula/local-coder.git
 cd local-coder
 
 # 1. Ollama must be running with the model already pulled.
-# scripts/ollama-serve-tuned.sh wraps `ollama serve` with settings sized for
-# a small/CPU-only box -- see "Ollama tuning" below for what each one does
-# and why; plain `ollama serve` also works, just slower to warm up and more
-# likely to hold more in RAM than a machine like this has to spare.
-./scripts/ollama-serve-tuned.sh &
+# scripts/ollama-tuned.service runs scripts/ollama-serve-tuned.sh as a
+# systemd --user service instead of a bare background job -- see "Ollama
+# tuning" below for why: a script backgrounded with `&` in a terminal dies
+# (and can orphan its inference child process, unreachable, still burning
+# CPU) the moment that terminal closes. The service survives that and
+# restarts itself on crash.
+mkdir -p ~/.local/bin ~/.config/systemd/user
+cp scripts/ollama-serve-tuned.sh ~/.local/bin/ollama-serve-tuned
+chmod +x ~/.local/bin/ollama-serve-tuned
+cp scripts/ollama-tuned.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ollama-tuned.service
 ollama pull qwen2.5-coder:7b     # skip if you already have it
 
 # 2. Build the CCE binary once (optional but recommended -- see below)
@@ -101,28 +108,50 @@ incomplete file. Same lesson as the tool-calling one above: a 7B model
 follows a plain textual convention more reliably than a schema, but "more
 reliably" isn't "always."
 
-## Ollama tuning (`scripts/ollama-serve-tuned.sh`)
+## Ollama tuning (`scripts/ollama-serve-tuned.sh` + `ollama-tuned.service`)
 
-Measured on this machine (Intel i5-7200U, 2 cores/4 threads, no GPU, 11GB
-RAM): the dominant cost is the CPU itself, no config fixes that. What tuning
-*can* do is stop the setup from working against its own hardware:
+Measured on this machine: Intel i5-7200U, 2 cores/4 threads, no GPU -- that
+CPU is the dominant, unfixable cost. RAM is a separate story: an earlier pass
+assumed 11GB total and tuned accordingly (`num_ctx` capped at 4096, two
+models deleted to save disk). Ollama's own startup log later showed the real
+number -- `total="19.4 GiB" available="15.1 GiB"` -- an 11GB reading that was
+either stale or measured under some constraint that no longer applies.
+Flagging the discrepancy rather than quietly re-tuning around it: the table
+below reflects the *measured* 19GB reality, not the original assumption.
+
+**Run it as a service, not a backgrounded script.** `ollama-serve-tuned &`
+in a terminal died the moment that terminal closed, and its `llama-server`
+inference child orphaned instead of dying with it -- kept running, pegged at
+high CPU, completely unreachable, until something noticed and killed it by
+hand. `ollama-tuned.service` (installed via the Quick Start above) wraps the
+same script in systemd --user with `Restart=on-failure` and
+`KillMode=control-group`, so it survives a closed terminal and takes its
+child down with it if it ever does die. Manage it with:
+
+```bash
+systemctl --user status ollama-tuned    # is it up?
+systemctl --user restart ollama-tuned   # picked up a config change
+systemctl --user stop ollama-tuned      # done for now
+```
 
 | Setting | Value | Why |
 |---|---|---|
-| `OLLAMA_CONTEXT_LENGTH` / `num_ctx` | 4096 | Ollama's own auto-scaling picks ~4K for a box this size (confirmed in its startup log: `default_num_ctx=4096`). `config.json` used to override this to 8192, which only bought slower prefill for headroom never used. |
+| `num_ctx` (in `config.json`) | 8192 | Ollama's own CPU-path default is a flat 4096 regardless of system RAM -- it doesn't auto-scale with RAM the way GPU/VRAM sizing does (confirmed in its own log: `default_num_ctx=4096` even with 15GB free). With 19GB actually available, doubling this buys real headroom for longer files/instructions without truncation, at an affordable RAM and prefill-time cost. |
+| `request_timeout_s` (in `config.json`) | 600 | Raised from 300: a real task should get the time it needs to actually finish, not be cut off mid-response for the sake of a tighter budget this hardware doesn't need. |
 | `OLLAMA_KV_CACHE_TYPE` | `q8_0` | Roughly halves KV-cache RAM; needs flash attention, which is on below. |
 | `OLLAMA_FLASH_ATTENTION` | `1` | Forced rather than left on "auto" — auto-detection is a reasonable default in general, but on a 2017 CPU it's worth confirming rather than assuming. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Avoids paying the ~15–20s cold-load cost between turns during a work session. |
 | `OLLAMA_MAX_LOADED_MODELS` | `1` | Never hold two models in RAM — matches the earlier finding that swapping between models mid-session is what caused request pile-ups. |
-| `OLLAMA_NUM_PARALLEL` | `1` | One request at a time; this CPU cannot usefully serve concurrent ones anyway (measured: concurrent requests just queue and each pays the full serial cost). |
+| `OLLAMA_NUM_PARALLEL` | `1` | One request at a time; this CPU cannot usefully serve concurrent ones anyway (measured: concurrent requests just queue and each pays the full serial cost -- running localcoder in two terminals at once means the second one waits for the first, not a bug, just serial hardware). |
 
 Two models beyond `qwen2.5-coder:7b` are worth keeping installed:
 `qwen3:4b`/`qwen3:8b` are the only ones on this machine confirmed to emit
 Ollama's structured `tool_calls` format reliably, if you ever build something
 that needs that instead of the `` ```write `` convention. `qwen2.5-coder:14b`
-and the redundant `qwen-claude:latest` alias were removed — the 14b never
-completed a trivial request within several minutes in testing, so it cost
-9GB of disk for a model this hardware can't practically run.
+and the redundant `qwen-claude:latest` alias were removed when RAM was
+believed to be the binding constraint; worth reconsidering the 14b now that
+the real RAM figure is known, though the CPU -- unchanged -- is still the
+harder limit for a model that size.
 
 ## Security
 

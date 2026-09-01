@@ -1,0 +1,17 @@
+[Unit]
+Description=Ollama (tuned for localcoder -- see scripts/ollama-serve-tuned.sh)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/ollama-serve-tuned
+Restart=on-failure
+RestartSec=3
+# Running the plain script in a terminal with `&` is fragile: closing that
+# terminal kills the daemon, but its llama-server child process can orphan
+# and keep the CPU pegged, unreachable, until something notices and kills
+# it by hand. KillMode=control-group takes the whole cgroup down together
+# instead. Learned the hard way -- see README's "Ollama tuning" section.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
