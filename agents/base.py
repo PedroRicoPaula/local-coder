@@ -6,6 +6,7 @@ model, no separate process, just a different framing of the same local model.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Iterator
 
 from llm.ollama_client import OllamaClient
 
@@ -22,5 +23,10 @@ class Agent(ABC):
         ...
 
     def run(self, task: str, context: str = "") -> str:
-        prompt = f"{context}\n\nTASK:\n{task}" if context else task
-        return self.llm.generate(prompt, system=self.system_prompt())
+        return self.llm.generate(self._prompt(task, context), system=self.system_prompt())
+
+    def run_stream(self, task: str, context: str = "") -> Iterator[dict]:
+        return self.llm.generate_stream(self._prompt(task, context), system=self.system_prompt())
+
+    def _prompt(self, task: str, context: str) -> str:
+        return f"{context}\n\nTASK:\n{task}" if context else task

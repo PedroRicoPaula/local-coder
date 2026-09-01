@@ -51,26 +51,90 @@ echo 'alias localcoder="python3 /path/to/local-coder/main.py"' >> ~/.bashrc
    near-instant, no LLM involved in this step) — falls back to raw file
    reads if the CCE binary isn't built yet.
 3. Injects any `.md` rule files from `skills/` into the system prompt.
-4. Sends one prompt to Ollama, generation only (no streaming, no chat
-   history across turns yet — see Limitations).
-5. Parses the reply for ` ```write:path ` fenced blocks and offers to write
-   each file, with a diff-free confirm prompt.
+4. Streams the response from Ollama live, token by token, instead of
+   sitting on a silent wait -- this hardware can take minutes per turn, and
+   watching output arrive is the difference between "working" and "did it
+   hang" (see "Streaming" below).
+5. Parses the complete reply for action blocks (write, delete, run, fetch,
+   or a display-only shell suggestion) and applies each one, individually
+   confirmed -- see "Actions" below.
+6. If a `run` or `fetch` produced output, feeds it back for up to two more
+   automatic turns so the model can act on what it learned (install a
+   dependency, then use it; read a page, then write against it) -- bounded,
+   not an open-ended agent loop, because each hop costs real CPU-minutes.
+
+## Streaming
+
+`llm/ollama_client.py`'s `generate_stream()` uses Ollama's native
+`stream: true` and prints fragments as they arrive (`main.py`'s
+`stream_and_print`). One thing this surfaced directly: `think: true`
+doesn't just get ignored by a model with no extended-thinking template --
+Ollama rejects the request outright with HTTP 400 ("does not support
+thinking"). `qwen2.5-coder` has no `<think>` branch in its chat template
+(unlike `qwen3`), so `think` stays `False` here; the value of streaming for
+this model is watching real response tokens arrive, not a distinct
+reasoning trace.
+
+## Actions
+
+Five fenced-block kinds, all sharing the same variable-length-fence
+convention (`actions.py`):
+
+| Block | Effect | Confirmed? | Fed back to the model? |
+|---|---|---|---|
+| ` ```write:path ` | create/replace a file | yes, y/N | no |
+| ` ```delete:path ` | remove a file | yes, y/N | no |
+| ` ```run ` | execute a shell command | yes, y/N, plus a denylist that refuses catastrophic patterns without even prompting | yes, up to 2 hops |
+| ` ```fetch:url ` | fetch a web page as text | yes, y/N, http(s) only | yes, up to 2 hops |
+| ` ```shell ` | show a command, don't run it | no execution at all | no |
+
+`run` and `fetch` are the only things that touch anything outside the
+project directory or the local machine. `fetch` is also the only thing that
+needs the network -- see "Why fetch breaks the offline claim" below.
+`execution.py`'s denylist (`rm -rf`, `mkfs`, `dd if=`, a fork bomb pattern,
+`shutdown`/`reboot`, writing to a raw block device, `sudo`) is mitigation,
+not a promise, same spirit as `context/denylist.py` — everything *not* on
+that list still needs an explicit y/N, which is the real gate, matching
+OWASP's AI Agent Security Cheat Sheet guidance for agentic CLIs: never
+blanket-grant execution, always require approval for anything with
+real-world effect.
+
+## Why `fetch` breaks the offline claim
+
+Every other action stays local. `fetch` needs a real HTTP request to
+wherever the model points it, which is a deliberate, confirmed exception to
+"100% offline" -- made because being able to read a page was worth more
+than the purity of the claim. It's opt-in per fetch (never automatic, always
+a y/N with the URL shown first), so nothing reaches the network without a
+human seeing the URL and saying yes.
+
+## Git safety net
+
+If the current directory is a git repo, every confirmed `write`/`delete` is
+auto-committed with a `localcoder: ` prefixed message (`gitsafety.py`).
+`/undo` reverts the last commit -- but only if its message has that prefix,
+so it can never discard a commit that was actually your own work, and it
+refuses (rather than doing something more elaborate) if that commit happens
+to be the repository's very first. Outside a git repo, the y/N prompt at
+write/delete time is the only safety net there is -- `git init` first if you
+want `/undo` available.
 
 ## Repo layout
 
 ```
-main.py               entry point / REPL
+main.py               entry point / REPL, run_turn's streaming + follow-up loop
 config.py, config.json    model, host, timeouts, budgets
 context/
   tree.py                project tree walker
   cce_client.py            MCP client wrapping the CCE binary
+  denylist.py               credential/key files, never sent as context
 llm/
-  ollama_client.py          HTTP client (urllib, stdlib only)
+  ollama_client.py          HTTP client (urllib, stdlib only), generate + generate_stream
   prompts.py                 system/user prompt assembly
 knowledge/loader.py           loads skills/*.md into the system prompt
 skills/                        <- put your own stack rules here as .md files
 agents/
-  base.py                    Agent base class
+  base.py                    Agent base class (run + run_stream)
   coder.py                    the default agent driving the REPL
   test_agent.py, refactor_agent.py   narrow-purpose sub-agents (stubs)
   registry.py                 name -> agent lookup
@@ -78,7 +142,12 @@ mcp/
   client.py                  generic stdio MCP client (JSON-RPC), reusable
                               for any future MCP server, not just CCE
 mcp.servers.json               MCP server list (context-compressor pre-wired)
-actions.py                      parses ```write blocks, applies them to disk
+actions.py                      parses all five action blocks, applies write/delete
+execution.py                     runs ```run blocks (denylist + confirm + capture)
+webfetch.py                      fetches ```fetch blocks (confirm + HTML-to-text)
+gitsafety.py                      auto-commit on confirmed changes, /undo
+security.py                       secret-shaped-string scan on generated content
+tests/                              unittest suite, see "Testing" below
 ```
 
 ## Why no JSON tool-calling
@@ -180,6 +249,38 @@ None of this defends against a determined attacker; it defends against the
 ordinary failure modes of pointing a local model at your files — it echoing
 something it shouldn't have seen, or a fenced block landing somewhere you
 didn't mean.
+
+## Testing
+
+```bash
+python3 -m unittest discover tests
+```
+
+Pure-logic tests (denylist, secret-pattern scan, action-block parsing
+including the nested-fence case, tree sorting/filtering, config merging,
+the command denylist, git commit/undo) run in well under a second, no
+Ollama or network needed. The one true end-to-end test is opt-in and slow
+for the same reason everything on this hardware is slow:
+
+```bash
+LOCALCODER_LIVE_TESTS=1 python3 -m unittest tests.test_live
+```
+
+It spawns `main.py` for real against a real running Ollama, feeds it an
+actual bug (`ZeroDivisionError` → should become a clear `ValueError`), and
+checks the *behavior* of the resulting code (imports it and calls the
+function) rather than grepping the source text for a particular phrasing.
+
+## Deferred: multi-context / subagent chunking
+
+Explicitly not built: splitting a large task across multiple model calls
+(one per chunk of files, then a synthesis call to combine them) or routing
+sub-tasks to a separate subagent to save time. On fully local, CPU-only
+hardware there's no metered cost to save by doing this — no per-token
+billing — so the only thing subagent chunking would trade is *more*
+multi-minute calls for *maybe* better coverage of a task too big for one
+context window. Deferred until a real task actually hits that limit,
+matching CCE's own "gated on evidence, not guesses" approach to its V2.
 
 ## Multi-agent / MCP: what's real vs. scaffold
 

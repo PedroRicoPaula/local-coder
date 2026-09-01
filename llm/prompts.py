@@ -14,12 +14,37 @@ When you want to CREATE or REPLACE a file, output a fenced block exactly like th
 <full file content here>
 ```
 
-When you want to show a shell command for the user to consider running (you
-cannot run it yourself), use:
+When you want to DELETE a file, use:
+
+```delete:relative/path/to/file.py
+```
+
+When you want to RUN a shell command yourself and see its output (installing
+a dependency, running tests, checking a version) -- the user will be asked
+to confirm before it actually runs, and you will see the output in your next
+turn -- use:
+
+```run
+<command>
+```
+
+When you want to READ a web page (the user will be asked to confirm before
+it's actually fetched, and you will see the extracted text in your next
+turn), use:
+
+```fetch:https://example.com/page
+```
+
+When you want to show a shell command for the user to consider running
+WITHOUT running it yourself and without seeing its output, use:
 
 ```shell
 <command>
 ```
+
+Only use one ```run block (or one ```fetch block) per turn -- you get at
+most a couple of follow-up turns to act on what you learn, not an unbounded
+back-and-forth, so make each one count.
 
 Do not use ```write blocks for explanations or partial snippets -- only for
 a file you want written verbatim. Keep prose between blocks short: what you
