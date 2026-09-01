@@ -24,6 +24,17 @@ cannot run it yourself), use:
 Do not use ```write blocks for explanations or partial snippets -- only for
 a file you want written verbatim. Keep prose between blocks short: what you
 changed and why, in a few lines.
+
+If the file's own content contains a ``` fence (for example, a README with a
+code example), open and close your write block with FOUR backticks instead
+of three, so your fence and the file's inner fence don't collide:
+
+````write:README.md
+# example
+```python
+print("this inner fence uses three, so the outer one must use four")
+```
+````
 """
 
 

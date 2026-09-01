@@ -65,7 +65,6 @@ def assemble_file_context(cce: CCEClient, project_root: str, paths: list[str], b
 def main() -> None:
     cfg = load_config()
     project_root = str(Path.cwd())
-    cfg["cce_root"] = project_root
 
     llm = OllamaClient(cfg["ollama_host"], cfg["model"], cfg["request_timeout_s"], cfg["num_ctx"])
     if not llm.is_up():
@@ -145,6 +144,11 @@ def main() -> None:
                 print(f"[localcoder] {e}")
                 continue
             handle_response(project_root, output)
+    except KeyboardInterrupt:
+        # Ctrl-C is the most likely way anyone exits this, and it's just as
+        # likely to land mid-generation (a multi-minute CPU wait) as at the
+        # prompt -- this catches it everywhere in the loop, not just input().
+        print("\n[localcoder] interrupted, exiting")
     finally:
         cce.stop()
 

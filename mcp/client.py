@@ -72,8 +72,7 @@ class MCPClient:
             assert self._proc.stdout is not None
             line = self._proc.stdout.readline()
             if not line:
-                stderr = ""
-                raise MCPError(f"MCP server closed stdout while calling {method}. {stderr}")
+                raise MCPError(f"MCP server closed stdout while calling {method}")
             response = json.loads(line)
             if "error" in response:
                 raise MCPError(f"{method} failed: {response['error']}")

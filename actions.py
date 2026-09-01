@@ -14,10 +14,10 @@ from pathlib import Path
 from security import find_suspected_secrets
 
 WRITE_BLOCK_RE = re.compile(
-    r"```write:([^\n`]+)\n(.*?)```", re.DOTALL
+    r"(`{3,})write:([^\n`]+)\n(.*?)\1", re.DOTALL
 )
 SHELL_BLOCK_RE = re.compile(
-    r"```shell\n(.*?)```", re.DOTALL
+    r"(`{3,})shell\n(.*?)\1", re.DOTALL
 )
 
 
@@ -29,13 +29,13 @@ class FileWrite:
 
 def extract_writes(model_output: str) -> list[FileWrite]:
     return [
-        FileWrite(path=m.group(1).strip(), content=m.group(2))
+        FileWrite(path=m.group(2).strip(), content=m.group(3))
         for m in WRITE_BLOCK_RE.finditer(model_output)
     ]
 
 
 def extract_shell_suggestions(model_output: str) -> list[str]:
-    return [m.group(1).strip() for m in SHELL_BLOCK_RE.finditer(model_output)]
+    return [m.group(2).strip() for m in SHELL_BLOCK_RE.finditer(model_output)]
 
 
 def strip_action_blocks(model_output: str) -> str:

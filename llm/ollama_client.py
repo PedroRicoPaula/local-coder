@@ -63,6 +63,13 @@ class OllamaClient:
                 f"Ollama took longer than {self.timeout_s}s to respond. "
                 "CPU-only inference is slow -- try a shorter prompt or raise request_timeout_s."
             ) from e
+        except (OSError, ValueError) as e:
+            # Catches the rest of the ways a long-lived local connection can
+            # die mid-response (connection reset, Ollama killed or OOM'd
+            # while generating -- plausible on an 11GB box) or come back
+            # malformed. Without this, either crashes the whole REPL loop
+            # instead of reporting one failed turn.
+            raise OllamaError(f"Lost connection to Ollama mid-request: {e}") from e
         if "error" in body:
             raise OllamaError(f"Ollama error: {body['error']}")
         return body.get(response_key, "")

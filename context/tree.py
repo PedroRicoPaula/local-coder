@@ -91,4 +91,9 @@ def list_source_files(root: str, extensions: tuple[str, ...] = (
                 out.append(str(entry.relative_to(root_path)))
 
     walk(root_path)
+    # Sorted so "first N" (main.py's default file-selection heuristic when
+    # nothing is pinned via /files) is at least deterministic and shallow
+    # paths first, rather than whatever order the filesystem happens to
+    # return -- not relevance ranking, just not arbitrary.
+    out.sort(key=lambda p: (p.count("/"), p))
     return out

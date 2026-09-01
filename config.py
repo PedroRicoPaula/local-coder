@@ -21,13 +21,12 @@ DEFAULTS = {
                                     # uses. Raise per-project if you actually
                                     # need it, don't raise it by default.
 
-    # Context-Compress-Engine (MCP stdio server)
+    # Context-Compress-Engine (MCP stdio server). CCE_ROOT is set per-instance
+    # at connect time (see context/cce_client.py), not read from here.
     "cce_binary": str(Path.home() / ".cargo" / "bin" / "context-compressor-mcp"),
-    "cce_root": None,              # set at runtime to the project cwd
 
     # Context assembly
     "max_tree_entries": 400,
-    "max_file_bytes_to_include": 20000,   # per file, after CCE compression
     "max_total_context_chars": 60000,     # hard budget for the whole prompt
 
     # Skills

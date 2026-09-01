@@ -88,6 +88,19 @@ with a plain regex (`actions.py`). No tool schema to get right, no silent
 failure mode — either the block is there or it isn't, and you see the raw
 text either way.
 
+The parser supports a variable-length fence (` ```` ` for a file whose own
+content has a ` ``` ` in it, e.g. a README) via a regex backreference, and
+the system prompt tells the model to use it. Measured directly: `7b` doesn't
+reliably follow that instruction either -- it still opens with three
+backticks even when the content has its own fence inside. The parser itself
+is correct (verified: a well-formed four-backtick block parses intact); what
+isn't guaranteed is the model choosing to emit one. When it doesn't, the
+write still comes out clean (whatever content came before the first inner
+fence), it just won't contain what came after -- no corruption, just an
+incomplete file. Same lesson as the tool-calling one above: a 7B model
+follows a plain textual convention more reliably than a schema, but "more
+reliably" isn't "always."
+
 ## Ollama tuning (`scripts/ollama-serve-tuned.sh`)
 
 Measured on this machine (Intel i5-7200U, 2 cores/4 threads, no GPU, 11GB
@@ -167,3 +180,13 @@ didn't mean.
 - **Context budget is a hard char cap** (`max_total_context_chars`), not a
   token count. It's a proxy, not exact — same caveat CCE's own docs note
   about byte-vs-token ratios.
+- **`get_symbol` is implemented (`context/cce_client.py`) but never called.**
+  Every file that reaches the model goes through `compress_file`'s outline
+  mode only; if the outline elides a function body the task actually needs,
+  there is currently no way for a turn to go get it back mid-response --
+  that would need the model to ask for more and the CLI to feed it back in,
+  i.e. a real follow-up loop, which conflicts with the single-shot
+  `generate()` design this project deliberately chose over unreliable
+  tool-calling (see "Why no JSON tool-calling" above). Noted rather than
+  built speculatively: worth revisiting if outline-mode context turns out to
+  be insufficient in practice, not before.
