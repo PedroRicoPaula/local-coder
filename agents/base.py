@@ -8,7 +8,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Iterator
 
-from llm.ollama_client import OllamaClient
+from llm.ollama_client import GenerationResult, OllamaClient
 
 
 class Agent(ABC):
@@ -22,7 +22,7 @@ class Agent(ABC):
     def system_prompt(self) -> str:
         ...
 
-    def run(self, task: str, context: str = "") -> str:
+    def run(self, task: str, context: str = "") -> GenerationResult:
         return self.llm.generate(self._prompt(task, context), system=self.system_prompt())
 
     def run_stream(self, task: str, context: str = "") -> Iterator[dict]:

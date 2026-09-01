@@ -13,6 +13,7 @@ class TestLoadConfig(unittest.TestCase):
         self.assertIn("model", cfg)
         self.assertIn("num_ctx", cfg)
         self.assertIn("ollama_host", cfg)
+        self.assertIn("max_total_context_chars", cfg)
 
     def test_json_overrides_merge_over_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -30,6 +31,33 @@ class TestLoadConfig(unittest.TestCase):
             with mock.patch.object(config, "CONFIG_FILE", bad_file):
                 cfg = config.load_config()
             self.assertEqual(cfg["num_ctx"], config.DEFAULTS["num_ctx"])
+
+
+class TestDeriveMaxContextChars(unittest.TestCase):
+    def test_derive_max_context_chars_bound(self):
+        derived = config.derive_max_context_chars(8192)
+        # Sanity bound: must be well under num_ctx * CHARS_PER_TOKEN (the
+        # unreserved fraction only), and clearly less than the old flat
+        # 60000 default this replaces -- the whole point of deriving it.
+        self.assertLess(derived, 8192 * config.CHARS_PER_TOKEN)
+        self.assertLess(derived, 60000)
+        self.assertGreater(derived, 0)
+
+    def test_auto_derives_budget_when_num_ctx_changes_and_chars_not_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override_file = Path(tmp) / "config.json"
+            override_file.write_text(json.dumps({"num_ctx": 1234}))
+            with mock.patch.object(config, "CONFIG_FILE", override_file):
+                cfg = config.load_config()
+            self.assertEqual(cfg["max_total_context_chars"], config.derive_max_context_chars(1234))
+
+    def test_respects_explicit_override_even_if_it_exceeds_derived(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override_file = Path(tmp) / "config.json"
+            override_file.write_text(json.dumps({"num_ctx": 1234, "max_total_context_chars": 99999}))
+            with mock.patch.object(config, "CONFIG_FILE", override_file):
+                cfg = config.load_config()
+            self.assertEqual(cfg["max_total_context_chars"], 99999)
 
 
 if __name__ == "__main__":

@@ -6,8 +6,23 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import ui
+
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
+
+CHARS_PER_TOKEN = 3.2      # Conservative: assumes MORE tokens per char than
+                            # the ~4 chars/token typical of English prose,
+                            # because code is denser (short identifiers,
+                            # heavy punctuation). No tokenizer library exists
+                            # in this project by design (stdlib only), so
+                            # this stays a documented ratio, not a
+                            # measurement -- the safe direction is to
+                            # overestimate token cost, not underestimate it.
+RESERVED_FRACTION = 0.35   # Fraction of num_ctx NOT available for file
+                            # context -- reserved for system prompt, tree,
+                            # skills, task text, and the model's own
+                            # response.
 
 DEFAULTS = {
     # Ollama
@@ -36,7 +51,9 @@ DEFAULTS = {
 
     # Context assembly
     "max_tree_entries": 400,
-    "max_total_context_chars": 60000,     # hard budget for the whole prompt
+    # NOTE: no "max_total_context_chars" default here -- it's derived from
+    # num_ctx by load_config() below unless the user sets it explicitly in
+    # config.json (see derive_max_context_chars).
 
     # Skills
     "skills_dir": str(ROOT / "skills"),
@@ -46,12 +63,30 @@ DEFAULTS = {
 }
 
 
+def derive_max_context_chars(num_ctx: int) -> int:
+    """Safe default for the file-context char budget, derived from the
+    model's real token window (num_ctx) instead of a flat guess disconnected
+    from it. At num_ctx=8192 this derives ~17800 chars -- previously a flat
+    60000 was used regardless of num_ctx, already ~3.5x past what the real
+    token window can safely hold before system prompt/tree/task text are
+    even counted, a latent silent-truncation risk on Ollama's side."""
+    return int(num_ctx * (1 - RESERVED_FRACTION) * CHARS_PER_TOKEN)
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULTS)
+    user_cfg: dict = {}
     if CONFIG_FILE.exists():
         try:
             user_cfg = json.loads(CONFIG_FILE.read_text())
             cfg.update(user_cfg)
         except (json.JSONDecodeError, OSError) as e:
-            print(f"[config] warning: could not read {CONFIG_FILE}: {e}")
+            ui.warn(f"could not read {CONFIG_FILE}: {e}")
+    if "max_total_context_chars" not in user_cfg:
+        # Not set by the user -- derive it from whatever num_ctx is in
+        # effect (default or overridden) so the two budgets never drift
+        # apart on their own. An explicit user value is respected as-is
+        # (main.py warns at startup if it exceeds the derived safe cap,
+        # rather than silently overriding an intentional choice).
+        cfg["max_total_context_chars"] = derive_max_context_chars(cfg["num_ctx"])
     return cfg

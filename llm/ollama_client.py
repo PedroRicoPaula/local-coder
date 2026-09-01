@@ -8,11 +8,50 @@ import json
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator
 
 
 class OllamaError(RuntimeError):
     pass
+
+
+@dataclass
+class Usage:
+    """Ollama reports real token counts and timings on the final chunk of
+    every request (streaming or not) -- this used to be read off the wire
+    and thrown away. `None` fields mean the value wasn't present (an older
+    Ollama version, or a response that errored before completion), never a
+    misleading 0."""
+    prompt_eval_count: int | None
+    eval_count: int | None
+    prompt_eval_duration: int | None  # nanoseconds
+    eval_duration: int | None         # nanoseconds
+    load_duration: int | None         # nanoseconds
+    total_duration: int | None        # nanoseconds
+
+    @classmethod
+    def from_chunk(cls, chunk: dict) -> "Usage":
+        return cls(
+            prompt_eval_count=chunk.get("prompt_eval_count"),
+            eval_count=chunk.get("eval_count"),
+            prompt_eval_duration=chunk.get("prompt_eval_duration"),
+            eval_duration=chunk.get("eval_duration"),
+            load_duration=chunk.get("load_duration"),
+            total_duration=chunk.get("total_duration"),
+        )
+
+    @property
+    def total_tokens(self) -> int | None:
+        if self.prompt_eval_count is None or self.eval_count is None:
+            return None
+        return self.prompt_eval_count + self.eval_count
+
+
+@dataclass
+class GenerationResult:
+    text: str
+    usage: Usage | None
 
 
 class OllamaClient:
@@ -30,7 +69,7 @@ class OllamaClient:
         except (urllib.error.URLError, OSError):
             return False
 
-    def generate(self, prompt: str, system: str | None = None, think: bool = False) -> str:
+    def generate(self, prompt: str, system: str | None = None, think: bool = False) -> GenerationResult:
         """Single-shot, non-streaming completion. Used by sub-agents that
         don't drive a live terminal display (agents/*.py) -- no reason to
         pay the streaming bookkeeping cost when nothing is watching."""
@@ -39,7 +78,7 @@ class OllamaClient:
             body = json.load(resp)
         if "error" in body:
             raise OllamaError(f"Ollama error: {body['error']}")
-        return body.get("response", "")
+        return GenerationResult(text=body.get("response", ""), usage=Usage.from_chunk(body))
 
     def generate_stream(self, prompt: str, system: str | None = None, think: bool = False) -> Iterator[dict]:
         """Streaming completion for the main REPL loop: yields each decoded
