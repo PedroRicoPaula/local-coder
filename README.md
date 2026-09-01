@@ -49,19 +49,29 @@ echo 'alias localcoder="python3 /path/to/local-coder/main.py"' >> ~/.bashrc
 1. Builds a compact tree of the current directory (`.gitignore`-aware).
 2. Compresses whichever files are in context through CCE (heuristic,
    near-instant, no LLM involved in this step) — falls back to raw file
-   reads if the CCE binary isn't built yet.
+   reads if the CCE binary isn't built yet. Any file that gets truncated or
+   skipped to fit the context budget prints a visible warning (not just an
+   inline marker only the model would see) -- see "Token usage & context
+   budget" below.
 3. Injects any `.md` rule files from `skills/` into the system prompt.
 4. Streams the response from Ollama live, token by token, instead of
-   sitting on a silent wait -- this hardware can take minutes per turn, and
-   watching output arrive is the difference between "working" and "did it
-   hang" (see "Streaming" below).
+   sitting on a silent wait. A spinner covers the gap before the first
+   token too -- connection + prompt prefill, the part that used to be pure
+   silence -- and each response ends with a colored token-usage bar (see
+   "Streaming" and "Token usage & context budget" below).
 5. Parses the complete reply for action blocks (write, delete, run, fetch,
-   or a display-only shell suggestion) and applies each one, individually
-   confirmed -- see "Actions" below.
-6. If a `run` or `fetch` produced output, feeds it back for up to two more
-   automatic turns so the model can act on what it learned (install a
-   dependency, then use it; read a page, then write against it) -- bounded,
-   not an open-ended agent loop, because each hop costs real CPU-minutes.
+   search, symbol, or a display-only shell suggestion) and applies each
+   one, individually confirmed -- see "Actions" below.
+6. If a `run`, `fetch`, `search`, or `symbol` produced output, feeds it back
+   for up to two more automatic turns so the model can act on what it
+   learned (install a dependency, then use it; read a page, then write
+   against it; look up a search result, then use it; ask for an elided
+   function body, then read it) -- bounded, not an open-ended agent loop,
+   because each hop costs real CPU-minutes. Each hop's output is truncated
+   heuristically (CCE has no generic text-compression tool, only
+   file/symbol-shaped ones) and the accumulated follow-up context is capped
+   against the same budget, dropping older hop results before newer ones
+   rather than growing unboundedly.
 
 ## Streaming
 
@@ -75,9 +85,57 @@ thinking"). `qwen2.5-coder` has no `<think>` branch in its chat template
 this model is watching real response tokens arrive, not a distinct
 reasoning trace.
 
+Before the first fragment arrives -- the connection plus Ollama's prompt
+prefill, which on this hardware can be the slowest part of a turn -- a
+spinner (`ui.Spinner`) animates with an elapsed-time counter, so the silent
+"is it hung?" gap that used to exist between hitting Enter and the first
+token is now visibly alive. It stops the instant real content starts
+streaming.
+
+## Terminal styling
+
+`ui.py` is a hand-rolled ANSI styling module -- no `rich`/`colorama`, stdlib
+only, matching this project's zero-pip-dependency design. It degrades to
+plain, uncolored text automatically when `NO_COLOR` is set or stdout isn't
+a real terminal (piped output, tests), so nothing here can corrupt a
+redirected or non-interactive run. Only the CLI's own messages (info,
+warnings, errors, the token-usage bar) get color; the model's own streamed
+text is never styled, so it can't collide with a literal escape-like
+sequence the model happens to emit.
+
+## Token usage & context budget
+
+Ollama reports real token counts and timings on the final chunk of every
+request (`prompt_eval_count`, `eval_count`, plus load/prompt-eval/eval
+durations) -- `llm/ollama_client.py`'s `Usage` dataclass captures them
+instead of discarding them, and every turn ends with a colored bar:
+
+```
+[############------------] 3600/8192 tokens (44%) -- prompt 3120 + resposta 480
+```
+
+Green under 60% of `num_ctx`, yellow 60-85%, red above 85%. If a turn's
+`prompt_eval_count` gets within ~2% of `num_ctx`, a warning prints directly:
+Ollama may have silently dropped the oldest part of the prompt to fit,
+meaning that turn's answer could be based on truncated context -- this is
+the most direct anti-hallucination signal this project has, since it comes
+from Ollama's own accounting rather than a guess.
+
+Two previously unrelated budgets are now reconciled: `num_ctx` (the real
+token window sent to Ollama) and `max_total_context_chars` (the char cap on
+file-context assembly). `config.py`'s `derive_max_context_chars()` derives
+a safe char budget from `num_ctx` (`~3.2 chars/token`, `65%` of the window
+reserved for file context, the rest held back for system prompt/tree/
+skills/task text) whenever `max_total_context_chars` isn't set explicitly
+in `config.json` -- at the default `num_ctx=8192` this derives ~17800
+chars, well under the old flat `60000` default, which was already ~3.5x
+past what the real token window could safely hold. An explicit override in
+`config.json` is still respected as-is, but a startup warning fires if it
+exceeds the derived safe cap.
+
 ## Actions
 
-Five fenced-block kinds, all sharing the same variable-length-fence
+Seven fenced-block kinds, all sharing the same variable-length-fence
 convention (`actions.py`):
 
 | Block | Effect | Confirmed? | Fed back to the model? |
@@ -85,28 +143,50 @@ convention (`actions.py`):
 | ` ```write:path ` | create/replace a file | yes, y/N | no |
 | ` ```delete:path ` | remove a file | yes, y/N | no |
 | ` ```run ` | execute a shell command | yes, y/N, plus a denylist that refuses catastrophic patterns without even prompting | yes, up to 2 hops |
-| ` ```fetch:url ` | fetch a web page as text | yes, y/N, http(s) only | yes, up to 2 hops |
+| ` ```fetch:url ` | fetch a web page as text | yes, y/N, http(s) only, skipped immediately if offline | yes, up to 2 hops |
+| ` ```search:query ` | search the web (DuckDuckGo, best-effort) | yes, y/N, skipped immediately if offline | yes, up to 2 hops |
+| ` ```symbol:path#name ` | ask CCE for one elided function/class's full body | no (read-only, local) | yes, up to 2 hops |
 | ` ```shell ` | show a command, don't run it | no execution at all | no |
 
-`run` and `fetch` are the only things that touch anything outside the
-project directory or the local machine. `fetch` is also the only thing that
-needs the network -- see "Why fetch breaks the offline claim" below.
-`execution.py`'s denylist (`rm -rf`, `mkfs`, `dd if=`, a fork bomb pattern,
-`shutdown`/`reboot`, writing to a raw block device, `sudo`) is mitigation,
-not a promise, same spirit as `context/denylist.py` — everything *not* on
-that list still needs an explicit y/N, which is the real gate, matching
-OWASP's AI Agent Security Cheat Sheet guidance for agentic CLIs: never
-blanket-grant execution, always require approval for anything with
-real-world effect.
+`run`, `fetch`, and `search` are the only things that touch anything
+outside the project directory or the local machine (`fetch`/`search` are
+also the only two that need the network -- see "Why fetch and search break
+the offline claim" below). `execution.py`'s denylist (`rm -rf`, `mkfs`,
+`dd if=`, a fork bomb pattern, `shutdown`/`reboot`, writing to a raw block
+device, `sudo`) is mitigation, not a promise, same spirit as
+`context/denylist.py` — everything *not* on that list still needs an
+explicit y/N, which is the real gate, matching OWASP's AI Agent Security
+Cheat Sheet guidance for agentic CLIs: never blanket-grant execution,
+always require approval for anything with real-world effect.
 
-## Why `fetch` breaks the offline claim
+## Web search
 
-Every other action stays local. `fetch` needs a real HTTP request to
-wherever the model points it, which is a deliberate, confirmed exception to
-"100% offline" -- made because being able to read a page was worth more
-than the purity of the claim. It's opt-in per fetch (never automatic, always
-a y/N with the URL shown first), so nothing reaches the network without a
-human seeing the URL and saying yes.
+`websearch.py` scrapes DuckDuckGo's HTML-only endpoint
+(`html.duckduckgo.com/html/`) with a hand-rolled stdlib `HTMLParser` --
+no API key, matching this project's zero-pip-dependency and zero-setup
+philosophy. `is_online()` is a cheap 2-second-timeout probe against that
+one endpoint (not a general internet check) used to skip the confirmation
+prompt entirely when a fetch/search is already known to be doomed, and to
+print an online/offline line in the startup banner. This is explicitly
+**best-effort, not a guarantee**: DuckDuckGo's markup or bot-detection
+heuristics can change with no notice and silently break the scraper --
+same spirit as `webfetch.py`'s HTML-to-text stripping and `security.py`'s
+secret-pattern scan. `/search <query>` in the REPL runs the same search
+without a confirmation prompt (you already typed the command) and prints
+results directly to the terminal rather than feeding them into the model's
+context automatically.
+
+## Why `fetch` and `search` break the offline claim
+
+Every other action stays local. `fetch`/`search` need a real HTTP request
+to wherever the model (or you, via `/search`) points them, which is a
+deliberate, confirmed exception to "100% offline" -- made because being
+able to read a page or look something up was worth more than the purity of
+the claim. Both are opt-in per call (never automatic, always a y/N with the
+URL or query shown first when the model requests them), so nothing reaches
+the network without a human seeing what's being sent and saying yes -- and
+both are skipped outright, with no prompt at all, when localcoder detects
+it's offline.
 
 ## Git safety net
 
@@ -123,13 +203,17 @@ want `/undo` available.
 
 ```
 main.py               entry point / REPL, run_turn's streaming + follow-up loop
-config.py, config.json    model, host, timeouts, budgets
+ui.py                   hand-rolled ANSI styling: colors, spinner, token-usage bar
+config.py, config.json    model, host, timeouts, budgets (max_total_context_chars
+                          derived from num_ctx unless set explicitly)
 context/
   tree.py                project tree walker
   cce_client.py            MCP client wrapping the CCE binary
   denylist.py               credential/key files, never sent as context
+  truncate.py                heuristic head+tail truncation for text CCE can't compress
 llm/
-  ollama_client.py          HTTP client (urllib, stdlib only), generate + generate_stream
+  ollama_client.py          HTTP client (urllib, stdlib only), generate + generate_stream,
+                            Usage/GenerationResult (real token counts from Ollama)
   prompts.py                 system/user prompt assembly
 knowledge/loader.py           loads skills/*.md into the system prompt
 skills/                        <- put your own stack rules here as .md files
@@ -142,9 +226,10 @@ mcp/
   client.py                  generic stdio MCP client (JSON-RPC), reusable
                               for any future MCP server, not just CCE
 mcp.servers.json               MCP server list (context-compressor pre-wired)
-actions.py                      parses all five action blocks, applies write/delete
+actions.py                      parses all seven action blocks, applies write/delete
 execution.py                     runs ```run blocks (denylist + confirm + capture)
 webfetch.py                      fetches ```fetch blocks (confirm + HTML-to-text)
+websearch.py                      DuckDuckGo HTML scrape for ```search blocks + /search
 gitsafety.py                      auto-commit on confirmed changes, /undo
 security.py                       secret-shaped-string scan on generated content
 tests/                              unittest suite, see "Testing" below
@@ -285,15 +370,55 @@ matching CCE's own "gated on evidence, not guesses" approach to its V2.
 ## Multi-agent / MCP: what's real vs. scaffold
 
 - **Real and working:** `mcp/client.py` is a generic stdio MCP client;
-  `context/cce_client.py` uses it against the CCE binary today.
-  `agents/registry.py` + `test`/`refactor` agents work now via
-  `/agent test <task>` — same model, narrower system prompt.
+  `context/cce_client.py` uses it against the CCE binary today, including
+  `get_symbol` (wired to the ```symbol action block, see "Actions" above --
+  no longer implemented-but-unused). `agents/registry.py` + `test`/
+  `refactor` agents work now via `/agent test <task>` — same model,
+  narrower system prompt.
 - **Scaffold, not wired up:** there is no orchestrator that automatically
   chains coder → test → refactor, and no Playwright/DB MCP server is
   connected. `mcp.servers.json` and `mcp/client.py` are shaped so adding one
   is "add an entry + a thin wrapper like `cce_client.py`", not a rewrite.
   This was deliberately left unbuilt rather than guessed at — wire it up
   once you know which second tool you actually want.
+
+## Troubleshooting: a turn that seems to take forever
+
+The spinner (`ui.Spinner`, see "Streaming" above) is the ground truth for
+"is it working" -- it only stops once real content starts arriving from
+Ollama. If it's animating with elapsed time climbing, localcoder is not
+hung; the question is what's actually slow. Measured directly (2026-09-01,
+see `docs/LESSONS_LEARNED.md` for the full investigation):
+
+1. **Cold prompt prefill is much slower than token generation on CPU-only
+   hardware.** A *fresh* call (no matching cached prompt prefix) can spend
+   several minutes just processing the system prompt + task before
+   generating a single response token -- measured at roughly 2.6 tokens/sec
+   prefill on the reference machine, versus ~1.6 tokens/sec generation.
+   This is why `BASE_SYSTEM_PROMPT` (`llm/prompts.py`) is kept as short as
+   it can be while still reliably teaching the action-block convention --
+   every character in it is paid for on every single turn. A *warm* call
+   (Ollama reusing a cached KV state for a repeated prompt prefix) can be
+   dramatically faster for the same token count -- so turnaround time can
+   vary a lot turn to turn on this hardware, and that's expected, not a
+   regression.
+2. **If a turn seems to hang far longer than the token-usage bar and
+   elapsed counter would justify, check for an orphaned Ollama process
+   first, before assuming something is broken:**
+   ```bash
+   ps aux | grep llama-server
+   ```
+   Ollama does not cancel the underlying computation when a client
+   disconnects mid-request (Ctrl+C at the wrong moment, a killed process, a
+   closed terminal) -- the `llama-server` subprocess keeps computing at
+   ~150-200% CPU until it finishes on its own, and with `OLLAMA_NUM_PARALLEL=1`
+   (see "Ollama tuning" below), *every later request queues behind it*,
+   including an unrelated, trivial one in a brand-new session. If `ps`
+   shows a `llama-server` process that's been running far longer than a
+   normal turn should take, kill it (`kill <pid>`) or
+   `systemctl --user restart ollama-tuned` to clear it -- the next request
+   will pay a fresh model-load cost (`OLLAMA_KEEP_ALIVE`, ~15-20s) but won't
+   be stuck behind the old one.
 
 ## Limitations (measured on this hardware, not assumed)
 
@@ -307,16 +432,28 @@ matching CCE's own "gated on evidence, not guesses" approach to its V2.
   `generate()` call with fresh context assembly. Cheap and predictable, but
   it means "no, the other file" won't work — be explicit each time, or use
   `/files` to pin what's relevant before asking.
-- **Context budget is a hard char cap** (`max_total_context_chars`), not a
-  token count. It's a proxy, not exact — same caveat CCE's own docs note
-  about byte-vs-token ratios.
-- **`get_symbol` is implemented (`context/cce_client.py`) but never called.**
-  Every file that reaches the model goes through `compress_file`'s outline
-  mode only; if the outline elides a function body the task actually needs,
-  there is currently no way for a turn to go get it back mid-response --
-  that would need the model to ask for more and the CLI to feed it back in,
-  i.e. a real follow-up loop, which conflicts with the single-shot
-  `generate()` design this project deliberately chose over unreliable
-  tool-calling (see "Why no JSON tool-calling" above). Noted rather than
-  built speculatively: worth revisiting if outline-mode context turns out to
-  be insufficient in practice, not before.
+- **Context budget is still a char cap** (`max_total_context_chars`), not an
+  exact token count — no tokenizer library exists in this project by design
+  (stdlib only). It's now *derived* from `num_ctx` (`config.py`'s
+  `derive_max_context_chars`, ~3.2 chars/token, 65% of the window reserved
+  for non-file-context text) instead of an unrelated flat guess, and the
+  real per-turn token counts Ollama reports (`Usage`, see "Token usage &
+  context budget" above) catch the cases where the char-based estimate
+  undershoots or overshoots — but it's still an estimate going in, not a
+  measurement, until the request actually comes back.
+- **CCE cannot compress arbitrary text**, only files (`compress_file`) and
+  named symbols (`get_symbol`) — confirmed directly against its Rust
+  source. `run`/`fetch`/`search` output in the follow-up-hop loop uses a
+  local heuristic head+tail truncation (`context/truncate.py`) instead,
+  which is simpler and can't be as semantically aware as CCE's own
+  outlining. Applying CCE to the project tree or to `skills/` content was
+  considered and rejected: the tree is synthesized listing text (not a real
+  file), and `skills/` is hand-curated prose already capped at 12000 chars
+  total — running a pipeline meant for source code over either risks
+  mangling content on purpose-written text for no measured benefit.
+- **`is_online()` is checked once at startup**, not re-probed every turn
+  (an extra network round trip per turn isn't worth it on hardware already
+  bound by CPU inference time) — the banner reflects the state at launch,
+  not necessarily mid-session changes in connectivity. `fetch`/`search`
+  still each re-check before actually running, so a stale "online" banner
+  can't cause a silent hang, only a slightly stale status line.
