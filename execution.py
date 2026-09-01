@@ -13,6 +13,8 @@ from __future__ import annotations
 import re
 import subprocess
 
+import ui
+
 MAX_OUTPUT_CHARS = 4000
 TIMEOUT_S = 120
 
@@ -36,13 +38,12 @@ def apply_run(project_root: str, command: str, confirm: bool = True) -> str | No
     """Returns captured output to feed back to the model, or None if the
     command was refused/denied/skipped (nothing to feed back)."""
     if is_denied(command):
-        print(f"  [security] refusing to run (matches a denied pattern): {command}")
+        ui.error(f"refusing to run (matches a denied pattern): {command}")
         return None
 
     if confirm:
-        answer = input(f"  run `{command}`? [y/N] ").strip().lower()
-        if answer != "y":
-            print("  skipped")
+        if not ui.confirm(f"  run `{command}`?"):
+            ui.sub("skipped")
             return None
 
     try:
@@ -51,14 +52,14 @@ def apply_run(project_root: str, command: str, confirm: bool = True) -> str | No
             capture_output=True, text=True, timeout=TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        print(f"  command timed out after {TIMEOUT_S}s")
+        ui.sub(f"command timed out after {TIMEOUT_S}s")
         return f"(command timed out after {TIMEOUT_S}s: {command})"
     except OSError as e:
-        print(f"  could not run command: {e}")
+        ui.sub(f"could not run command: {e}")
         return None
 
     output = (result.stdout or "") + (result.stderr or "")
     if len(output) > MAX_OUTPUT_CHARS:
         output = output[:MAX_OUTPUT_CHARS] + "\n...(truncated)"
-    print(output if output.strip() else "  (no output)")
+    ui.sub(output if output.strip() else "(no output)")
     return f"$ {command}\n(exit {result.returncode})\n{output}"
