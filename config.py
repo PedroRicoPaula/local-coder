@@ -32,6 +32,44 @@ DEFAULTS = {
                                     # Raised from 300s: a real task (not a
                                     # smoke test) can need more room to finish
                                     # rather than being cut off mid-response.
+    "reuse_context_across_turns": True,  # Thread Ollama's returned `context`
+                                    # token array from one REPL turn into the
+                                    # next, so the system prompt (and tree,
+                                    # while /tree or /files haven't run since)
+                                    # isn't re-prefilled from zero every turn
+                                    # -- see llm/ollama_client.py's generate()
+                                    # docstring and ollama/ollama#14780. A
+                                    # kill switch in case it ever misbehaves;
+                                    # intra-turn follow-up hops always reuse
+                                    # context regardless of this setting.
+    "model_profiles": {              # Opt-in via --profile; an explicit
+                                    # top-level "model" in config.json always
+                                    # wins over a profile (see
+                                    # explicit_model_in_config_file()).
+        "fast": {"model": "qwen3:4b", "num_ctx": 8192},
+        "quality": {"model": "qwen2.5-coder:7b", "num_ctx": 8192},
+    },
+    "default_profile": "quality",
+    "num_batch": 2048,               # Larger prompt-eval batch than Ollama's
+                                    # own 512 default -- reported 2-3x faster
+                                    # prompt evaluation from fewer forward
+                                    # passes over the prompt. Per-request
+                                    # `options` field, NOT an env var --
+                                    # verified against this project's own
+                                    # Ollama 0.33.2 install (no
+                                    # OLLAMA_NUM_BATCH exists in the binary).
+                                    # Set to null in config.json to omit it
+                                    # and let Ollama use its own default.
+    "num_thread": 2,                # Pin to this reference machine's 2
+                                    # physical cores, not the 4 logical
+                                    # (hyperthreaded) ones Ollama would
+                                    # otherwise use -- exceeding physical
+                                    # cores has been measured elsewhere to
+                                    # cost 5-10% throughput from cache
+                                    # contention on CPU-only inference.
+                                    # Machine-specific: override in
+                                    # config.json to match your own CPU's
+                                    # physical core count, or set to null.
     "num_ctx": 8192,                # Ollama's own CPU default is a flat 4096
                                     # regardless of system RAM (confirmed in
                                     # its own startup log -- CPU inference
@@ -71,6 +109,19 @@ def derive_max_context_chars(num_ctx: int) -> int:
     token window can safely hold before system prompt/tree/task text are
     even counted, a latent silent-truncation risk on Ollama's side."""
     return int(num_ctx * (1 - RESERVED_FRACTION) * CHARS_PER_TOKEN)
+
+
+def explicit_model_in_config_file() -> str | None:
+    """Whether config.json itself pins a "model" key, distinct from just
+    inheriting DEFAULTS -- used to decide whether a --profile flag is
+    allowed to override it. An explicit user choice in config.json always
+    wins over a profile."""
+    if not CONFIG_FILE.exists():
+        return None
+    try:
+        return json.loads(CONFIG_FILE.read_text()).get("model")
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def load_config() -> dict:

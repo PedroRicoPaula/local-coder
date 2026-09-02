@@ -33,6 +33,46 @@ class TestLoadConfig(unittest.TestCase):
             self.assertEqual(cfg["num_ctx"], config.DEFAULTS["num_ctx"])
 
 
+class TestExplicitModelInConfigFile(unittest.TestCase):
+    def test_none_when_no_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(config, "CONFIG_FILE", Path(tmp) / "missing.json"):
+                self.assertIsNone(config.explicit_model_in_config_file())
+
+    def test_none_when_config_file_has_no_model_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override_file = Path(tmp) / "config.json"
+            override_file.write_text(json.dumps({"num_ctx": 1234}))
+            with mock.patch.object(config, "CONFIG_FILE", override_file):
+                self.assertIsNone(config.explicit_model_in_config_file())
+
+    def test_returns_explicit_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            override_file = Path(tmp) / "config.json"
+            override_file.write_text(json.dumps({"model": "qwen3:8b"}))
+            with mock.patch.object(config, "CONFIG_FILE", override_file):
+                self.assertEqual(config.explicit_model_in_config_file(), "qwen3:8b")
+
+    def test_malformed_json_returns_none_not_an_exception(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_file = Path(tmp) / "config.json"
+            bad_file.write_text("{not valid json")
+            with mock.patch.object(config, "CONFIG_FILE", bad_file):
+                self.assertIsNone(config.explicit_model_in_config_file())
+
+
+class TestModelProfiles(unittest.TestCase):
+    def test_default_profiles_present(self):
+        cfg = config.load_config()
+        self.assertIn("fast", cfg["model_profiles"])
+        self.assertIn("quality", cfg["model_profiles"])
+        self.assertEqual(cfg["default_profile"], "quality")
+
+    def test_reuse_context_across_turns_defaults_true(self):
+        cfg = config.load_config()
+        self.assertTrue(cfg["reuse_context_across_turns"])
+
+
 class TestDeriveMaxContextChars(unittest.TestCase):
     def test_derive_max_context_chars_bound(self):
         derived = config.derive_max_context_chars(8192)

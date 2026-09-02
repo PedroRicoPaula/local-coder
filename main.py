@@ -7,6 +7,7 @@ Python 3.10+ runs. Offline except for two opt-in actions, `fetch` and
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -29,6 +30,7 @@ from context.denylist import is_denied
 from context.tree import build_tree, list_source_files
 from context.truncate import truncate_text
 from knowledge.loader import load_skills
+from llm import busy
 from llm.ollama_client import OllamaClient, OllamaError, Usage
 from llm.prompts import build_user_prompt
 
@@ -40,11 +42,22 @@ Type an instruction, or one of:
   /files <a.py> <b.py>   pin specific files as context for the next turn
   /agent <name> <task>   run a sub-agent once (test, refactor)
   /agents                list available sub-agents
+  /model <name>          switch model for this session (e.g. qwen3:4b)
   /search <query>        search the web (only if online), shown here directly
   /undo                  revert the last change localcoder committed (git repos only)
   /tree                  reprint the project tree
   /quit                  exit
 """
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="localcoder -- local, offline coding assistant")
+    parser.add_argument(
+        "--profile", choices=["fast", "quality"],
+        help="model profile from config.json's model_profiles (ignored if config.json pins an explicit model)",
+    )
+    parser.add_argument("--model", help="explicit model name -- overrides --profile and config.json")
+    return parser.parse_args(argv)
 
 
 def assemble_file_context(
@@ -115,20 +128,21 @@ def print_usage_summary(usage: Usage | None, num_ctx: int) -> None:
         )
 
 
-def stream_and_print(chunks: Iterator[dict]) -> tuple[str, Usage | None]:
+def stream_and_print(chunks: Iterator[dict]) -> tuple[str, Usage | None, list[int] | None]:
     """Prints `thinking`/`response` fragments live as Ollama emits them and
-    returns (accumulated response text, real usage stats from the final
-    chunk). A spinner covers the silent gap before the first fragment
-    arrives -- connection + prompt prefill, exactly the "is it hung?" window
-    on CPU-only hardware where a turn can take minutes. Note: qwen2.5-coder's
-    template has no extended-thinking branch, so `thinking` fragments will
-    likely never appear for this model -- harmless to check for, just don't
-    expect to see them.
+    returns (accumulated response text, real usage stats, and the KV
+    context array) from the final chunk. A spinner covers the silent gap
+    before the first fragment arrives -- connection + prompt prefill,
+    exactly the "is it hung?" window on CPU-only hardware where a turn can
+    take minutes. Note: qwen2.5-coder's template has no extended-thinking
+    branch, so `thinking` fragments will likely never appear for this
+    model -- harmless to check for, just don't expect to see them.
     """
     response_parts: list[str] = []
     thinking_started = False
     response_started = False
     usage: Usage | None = None
+    kv_context: list[int] | None = None
     spinner = ui.Spinner("a aguardar o modelo")
     spinner.start()
     try:
@@ -150,11 +164,12 @@ def stream_and_print(chunks: Iterator[dict]) -> tuple[str, Usage | None]:
                 response_parts.append(response)
             if chunk.get("done"):
                 usage = Usage.from_chunk(chunk)
+                kv_context = chunk.get("context")
                 break
     finally:
         spinner.stop()
     print()
-    return "".join(response_parts), usage
+    return "".join(response_parts), usage, kv_context
 
 
 def run_turn(
@@ -165,7 +180,8 @@ def run_turn(
     cce: CCEClient,
     num_ctx: int,
     max_total_context_chars: int,
-) -> None:
+    initial_kv_context: list[int] | None = None,
+) -> list[int] | None:
     """Streams a response, applies every action block it contains, and --
     only if a ```run/```fetch/```search/```symbol actually produced output --
     feeds that back for up to MAX_FOLLOWUP_TURNS more turns. write/delete
@@ -174,14 +190,51 @@ def run_turn(
     no generic text-compression tool, only file/symbol-shaped ones) and the
     accumulated follow-up context is capped against max_total_context_chars,
     dropping older hop results (keeping the most recent) rather than
-    growing unboundedly across hops."""
+    growing unboundedly across hops.
+
+    `initial_kv_context` seeds this turn with a KV-cache token array from a
+    previous call (see llm/ollama_client.py's generate() docstring) --
+    `None` means prefill from scratch, matching the pre-existing behavior.
+    Regardless of what's passed in, once hop 0 completes, every later hop
+    within *this* call reuses hop 0's returned context automatically: the
+    follow-up prompt sent on hop >=1 is then just the new
+    "RESULT OF YOUR LAST ACTION" delta, not the whole accumulated task text
+    (which is already covered by the cached prefix -- resending it too
+    would re-prefill text Ollama already has and could duplicate it ahead
+    of the new tokens). `current_task` keeps growing/truncating exactly as
+    before regardless, since it's still what num_ctx budget bookkeeping and
+    the no-cache fallback path use.
+
+    Returns the final KV context array (or None) so the caller can offer it
+    to the *next* run_turn() call, if it wants to."""
     current_task = task
+    hop_kv_context = initial_kv_context
     for hop in range(MAX_FOLLOWUP_TURNS + 1):
+        if hop == 0:
+            # Start of a new task: current_task IS the new content (there's
+            # no "delta" yet, even if initial_kv_context carries a cached
+            # prefix from a previous turn) -- always send it in full, just
+            # let Ollama skip re-prefilling whatever initial_kv_context
+            # already covers.
+            prompt_to_send, context_to_send = current_task, context
+        elif hop_kv_context is not None:
+            # A later hop within this same call: hop_kv_context now covers
+            # everything up to and including the previous hop's response,
+            # so only the new follow-up delta needs sending.
+            prompt_to_send, context_to_send = appended, ""
+        else:
+            # No cache available (e.g. an Ollama version that never
+            # returned a context array) -- fall back to resending
+            # everything, same as before this feature existed.
+            prompt_to_send, context_to_send = current_task, context
         try:
-            output, usage = stream_and_print(agent.run_stream(current_task, context))
+            output, usage, new_kv_context = stream_and_print(
+                agent.run_stream(prompt_to_send, context_to_send, kv_context=hop_kv_context)
+            )
         except OllamaError as e:
             ui.error(str(e))
-            return
+            return hop_kv_context
+        hop_kv_context = new_kv_context
 
         print_usage_summary(usage, num_ctx)
 
@@ -215,10 +268,10 @@ def run_turn(
             )
 
         if not action_results:
-            return
+            return hop_kv_context
         if hop >= MAX_FOLLOWUP_TURNS:
             ui.info(f"follow-up limit reached ({MAX_FOLLOWUP_TURNS}) -- stopping here")
-            return
+            return hop_kv_context
 
         appended = (
             f"\n\n--- RESULT OF YOUR LAST ACTION ---\n"
@@ -236,15 +289,51 @@ def run_turn(
                 f"{truncate_text(action_results[-1], max_chars=max_total_context_chars // 2)}\n"
                 "--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
             )
+            # The cached prefix (hop_kv_context) covers the *dropped* history
+            # too -- once older hops are discarded, "resend just the delta"
+            # no longer means the same thing (the delta would land on top of
+            # a prefix that includes text we just chose to drop from
+            # `current_task`). Fall back to a clean, uncached resend of the
+            # freshly-rebuilt current_task next hop rather than risk sending
+            # a confusing/duplicated prompt.
+            hop_kv_context = None
         else:
             current_task += appended
+    return hop_kv_context
+
+
+def resolve_model_config(cfg: dict, args: argparse.Namespace) -> dict:
+    """Applies --model/--profile precedence on top of an already-loaded
+    config: an explicit --model always wins; --profile is ignored (with a
+    message, not silently) if config.json itself pins a model, since an
+    explicit user choice there always beats a profile; an unknown profile
+    name is warned about and otherwise ignored. Returns a new dict rather
+    than mutating `cfg` in place, so it's cheap to call from a test with a
+    plain dict and no real config.json on disk."""
+    cfg = dict(cfg)
+    if args.model:
+        cfg["model"] = args.model
+    elif args.profile:
+        if config.explicit_model_in_config_file():
+            ui.info(f"config.json define um modelo explícito -- a ignorar --profile '{args.profile}'")
+        else:
+            profile = cfg.get("model_profiles", {}).get(args.profile)
+            if profile:
+                cfg.update(profile)
+            else:
+                ui.warn(f"perfil '{args.profile}' desconhecido -- a usar o modelo de config.json")
+    return cfg
 
 
 def main() -> None:
-    cfg = load_config()
+    args = parse_args()
+    cfg = resolve_model_config(load_config(), args)
     project_root = str(Path.cwd())
 
-    llm = OllamaClient(cfg["ollama_host"], cfg["model"], cfg["request_timeout_s"], cfg["num_ctx"])
+    llm = OllamaClient(
+        cfg["ollama_host"], cfg["model"], cfg["request_timeout_s"], cfg["num_ctx"],
+        num_batch=cfg.get("num_batch"), num_thread=cfg.get("num_thread"),
+    )
     if not llm.is_up():
         ui.error(f"Ollama is not reachable at {cfg['ollama_host']}.")
         print("Start it with: ollama serve")
@@ -289,6 +378,9 @@ def main() -> None:
     tree = build_tree(project_root, cfg["max_tree_entries"])
     pinned_files: list[str] = []
     cce_died_warned = False
+    reuse_across_turns = bool(cfg.get("reuse_context_across_turns", True))
+    session_kv_context: list[int] | None = None
+    kv_reuse_announced = False
 
     def check_cce_alive() -> None:
         nonlocal cce_died_warned
@@ -312,6 +404,27 @@ def main() -> None:
             )
         return context
 
+    def call_run_turn(agent, task, ctx, initial_kv_context=None):
+        """Wraps run_turn with the orphaned-generation check + advisory
+        lock from llm/busy.py. Kept out of run_turn itself so that function
+        stays a pure, easily-testable unit (no filesystem lock I/O to mock
+        in tests/test_main.py)."""
+        stale_pid = busy.check_stale_lock()
+        if stale_pid is not None:
+            running = busy.list_running(cfg["ollama_host"])
+            if running:
+                ui.warn(
+                    f"o Ollama pode ainda estar a processar um pedido órfão de uma sessão "
+                    f"anterior (pid {stale_pid} já não existe, mas continua carregado: "
+                    f"{', '.join(running)}) -- este pedido pode ficar em fila atrás dele; "
+                    "ver 'ps aux | grep llama-server'"
+                )
+        with busy.held():
+            return run_turn(
+                agent, task, ctx, project_root, cce, cfg["num_ctx"], cfg["max_total_context_chars"],
+                initial_kv_context=initial_kv_context,
+            )
+
     try:
         while True:
             try:
@@ -325,6 +438,7 @@ def main() -> None:
                 break
             if line == "/tree":
                 tree = build_tree(project_root, cfg["max_tree_entries"])
+                session_kv_context = None  # tree text is part of what's cached; it just changed
                 print(tree)
                 continue
             if line == "/agents":
@@ -337,7 +451,13 @@ def main() -> None:
                 continue
             if line.startswith("/files "):
                 pinned_files = line.removeprefix("/files ").split()
+                session_kv_context = None  # pinned files change what's cached too
                 ui.info(f"pinned: {', '.join(pinned_files) or '(none)'}")
+                continue
+            if line.startswith("/model "):
+                llm.model = line.removeprefix("/model ").strip()
+                session_kv_context = None  # a different model invalidates any cached KV state
+                ui.info(f"modelo alterado para '{llm.model}' (contexto de sessão reiniciado)")
                 continue
             if line.startswith("/search "):
                 query = line.removeprefix("/search ").strip()
@@ -357,7 +477,12 @@ def main() -> None:
                     continue
                 check_cce_alive()
                 context = build_context(pinned_files, task)
-                run_turn(agent, task, context, project_root, cce, cfg["num_ctx"], cfg["max_total_context_chars"])
+                # A sub-agent has its own system prompt, so it can't share the
+                # main coder's cached kv_context -- and running it invalidates
+                # that cache server-side too (a different request just went
+                # through Ollama's single active slot), so drop it here.
+                call_run_turn(agent, task, context)
+                session_kv_context = None
                 continue
 
             # Default: main coder turn.
@@ -365,7 +490,16 @@ def main() -> None:
             files_for_context = pinned_files or list_source_files(project_root)[:5]
             file_context = build_context(files_for_context, line)
             prompt = build_user_prompt(line, tree, file_context)
-            run_turn(coder, prompt, "", project_root, cce, cfg["num_ctx"], cfg["max_total_context_chars"])
+            kv_in = session_kv_context if reuse_across_turns else None
+            session_kv_context = call_run_turn(coder, prompt, "", initial_kv_context=kv_in)
+            if not reuse_across_turns:
+                session_kv_context = None
+            elif session_kv_context is not None and not kv_reuse_announced:
+                ui.info(
+                    "reaproveitamento de contexto Ollama ativo -- turnos seguintes nesta "
+                    "sessão devem pré-processar mais depressa"
+                )
+                kv_reuse_announced = True
     except KeyboardInterrupt:
         # Ctrl-C is the most likely way anyone exits this, and it's just as
         # likely to land mid-generation (a multi-minute CPU wait) as at the

@@ -52,14 +52,33 @@ class Usage:
 class GenerationResult:
     text: str
     usage: Usage | None
+    context: list[int] | None = None
 
 
 class OllamaClient:
-    def __init__(self, host: str, model: str, timeout_s: int = 300, num_ctx: int = 8192):
+    def __init__(
+        self,
+        host: str,
+        model: str,
+        timeout_s: int = 300,
+        num_ctx: int = 8192,
+        num_batch: int | None = None,
+        num_thread: int | None = None,
+    ):
+        """`num_batch`/`num_thread` are per-request `options` fields, same
+        as `num_ctx` -- NOT server-wide env vars. Verified directly against
+        this project's own Ollama install (0.33.2): no OLLAMA_NUM_BATCH or
+        OLLAMA_NUM_THREAD env var exists in the binary at all (checked via
+        `strings` and the server's own logged startup config). `None`
+        (the default) omits the field from the request entirely, letting
+        Ollama use its own default -- matching this client's existing
+        "None means don't touch it" convention for optional fields."""
         self.host = host.rstrip("/")
         self.model = model
         self.timeout_s = timeout_s
         self.num_ctx = num_ctx
+        self.num_batch = num_batch
+        self.num_thread = num_thread
 
     def is_up(self) -> bool:
         try:
@@ -69,18 +88,40 @@ class OllamaClient:
         except (urllib.error.URLError, OSError):
             return False
 
-    def generate(self, prompt: str, system: str | None = None, think: bool = False) -> GenerationResult:
+    def generate(
+        self,
+        prompt: str,
+        system: str | None = None,
+        think: bool = False,
+        context: list[int] | None = None,
+    ) -> GenerationResult:
         """Single-shot, non-streaming completion. Used by sub-agents that
         don't drive a live terminal display (agents/*.py) -- no reason to
-        pay the streaming bookkeeping cost when nothing is watching."""
-        payload = self._payload(prompt, system, think, stream=False)
+        pay the streaming bookkeeping cost when nothing is watching.
+
+        `context` is the token-ID array Ollama returned from a *previous*
+        call -- passing it back is the documented workaround for Ollama's
+        CPU backend otherwise never reusing KV cache across calls (see
+        ollama/ollama#14780). `None` means "no cached prefix, prefill from
+        scratch", which is today's behavior unchanged."""
+        payload = self._payload(prompt, system, think, stream=False, context=context)
         with self._request("/api/generate", payload) as resp:
             body = json.load(resp)
         if "error" in body:
             raise OllamaError(f"Ollama error: {body['error']}")
-        return GenerationResult(text=body.get("response", ""), usage=Usage.from_chunk(body))
+        return GenerationResult(
+            text=body.get("response", ""),
+            usage=Usage.from_chunk(body),
+            context=body.get("context"),
+        )
 
-    def generate_stream(self, prompt: str, system: str | None = None, think: bool = False) -> Iterator[dict]:
+    def generate_stream(
+        self,
+        prompt: str,
+        system: str | None = None,
+        think: bool = False,
+        context: list[int] | None = None,
+    ) -> Iterator[dict]:
         """Streaming completion for the main REPL loop: yields each decoded
         JSON chunk as Ollama emits it, so the caller can print `thinking`/
         `response` fragments live instead of sitting on a silent multi-
@@ -96,8 +137,13 @@ class OllamaClient:
         HTTP 400 ("does not support thinking"). The live value of streaming
         here is seeing response tokens arrive as they're generated; it was
         never going to be a distinct reasoning trace for this model.
+
+        `context`: see generate()'s docstring. The final chunk (`done:
+        true`) carries the new context array to pass into the *next* call
+        -- the caller (main.py's stream_and_print) is responsible for
+        capturing it off that chunk, same as it already does for `Usage`.
         """
-        payload = self._payload(prompt, system, think, stream=True)
+        payload = self._payload(prompt, system, think, stream=True, context=context)
         with self._request("/api/generate", payload) as resp:
             for line in resp:
                 line = line.strip()
@@ -108,15 +154,30 @@ class OllamaClient:
                     raise OllamaError(f"Ollama error: {chunk['error']}")
                 yield chunk
 
-    def _payload(self, prompt: str, system: str | None, think: bool, stream: bool) -> dict:
-        return {
+    def _payload(
+        self,
+        prompt: str,
+        system: str | None,
+        think: bool,
+        stream: bool,
+        context: list[int] | None = None,
+    ) -> dict:
+        options = {"num_ctx": self.num_ctx}
+        if self.num_batch is not None:
+            options["num_batch"] = self.num_batch
+        if self.num_thread is not None:
+            options["num_thread"] = self.num_thread
+        payload = {
             "model": self.model,
             "prompt": prompt,
             "system": system or "",
             "think": think,
             "stream": stream,
-            "options": {"num_ctx": self.num_ctx},
+            "options": options,
         }
+        if context is not None:
+            payload["context"] = context
+        return payload
 
     @contextmanager
     def _request(self, path: str, payload: dict):
