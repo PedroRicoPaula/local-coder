@@ -11,37 +11,28 @@ dependencies (stdlib only) — nothing here needs internet access at run time.
 git clone https://github.com/PedroRicoPaula/local-coder.git
 cd local-coder
 
-# 1. Ollama must be running with the model already pulled.
-# scripts/ollama-tuned.service runs scripts/ollama-serve-tuned.sh as a
-# systemd --user service instead of a bare background job -- see "Ollama
-# tuning" below for why: a script backgrounded with `&` in a terminal dies
-# (and can orphan its inference child process, unreachable, still burning
-# CPU) the moment that terminal closes. The service survives that and
-# restarts itself on crash.
-mkdir -p ~/.local/bin ~/.config/systemd/user
-cp scripts/ollama-serve-tuned.sh ~/.local/bin/ollama-serve-tuned
-chmod +x ~/.local/bin/ollama-serve-tuned
-cp scripts/ollama-tuned.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now ollama-tuned.service
+# 1. Ollama must already be installed (https://ollama.com) and the model
+# pulled -- install.sh doesn't do either, it only configures what's there.
 ollama pull qwen2.5-coder:7b     # skip if you already have it
 
-# 2. Build the CCE binary once (optional but recommended -- see below)
+# 2. Detects this machine's CPU/RAM/GPU, writes a config.json tuned for it,
+# installs scripts/ollama-serve-tuned.sh as a systemd --user service (see
+# "Ollama tuning" below for why a service, not a backgrounded script), and
+# puts a `localcoder` launcher on PATH. Safe to re-run -- never overwrites
+# an existing config.json. Linux + systemd only (see docs/BACKLOG.md); on
+# anything else, run the steps inside scripts/install.sh by hand.
+./scripts/install.sh
+
+# 3. Build the CCE binary once (optional but recommended -- see below)
 git clone https://github.com/PedroRicoPaula/Context-Compress-Engine.git ../Context-Compress-Engine
 cd ../Context-Compress-Engine
 cargo build --release
 cp target/release/context-compressor-mcp ~/.cargo/bin/
 cd -
 
-# 3. Run localcoder from inside the project you want to work on
+# 4. Run localcoder from inside the project you want to work on
 cd /path/to/your/project
-python3 /path/to/local-coder/main.py
-```
-
-Add an alias for convenience (adjust the path to wherever you cloned this):
-
-```bash
-echo 'alias localcoder="python3 /path/to/local-coder/main.py"' >> ~/.bashrc
+localcoder
 ```
 
 ## What it does each turn
@@ -91,6 +82,35 @@ spinner (`ui.Spinner`) animates with an elapsed-time counter, so the silent
 "is it hung?" gap that used to exist between hitting Enter and the first
 token is now visibly alive. It stops the instant real content starts
 streaming.
+
+## Context reuse (skipping repeated prefill)
+
+Every turn used to re-prefill the full system prompt (and tree, if
+`/files`/`/tree` hadn't run since) from zero, even though that text is
+identical turn to turn -- measured at ~290s just for the system prompt on
+this hardware (`docs/LESSONS_LEARNED.md`). Ollama has a confirmed CPU
+backend bug where KV cache is otherwise never reused across `/api/generate`
+calls unless the caller passes back the `context` token array a previous
+call returned (ollama/ollama#14780) -- so that's what `main.py`/
+`llm/ollama_client.py` now do, in two places:
+
+- **Within one turn's follow-up hops** (`run_turn`'s loop, up to
+  `MAX_FOLLOWUP_TURNS`): always on, no design tradeoff -- hop 2 only sends
+  the new "RESULT OF YOUR LAST ACTION" delta, not the whole accumulated
+  task text, since that's already covered by hop 1's cached context.
+- **Across turns in the same REPL session**: opt-out via
+  `"reuse_context_across_turns": false` in `config.json` (default `true`).
+  Reset automatically on `/tree`, `/files`, `/model`, and `/agent
+  <name>` — anything that changes what's cached or switches to a different
+  system prompt invalidates the old context array, so it's dropped rather
+  than resent stale.
+
+Either way, `system` is omitted (not resent) on any call carrying a cached
+`context` -- it's already baked in from the call that produced it;
+resending it on top risks duplicating it ahead of the new prompt tokens or
+breaking the prefix match the whole optimization depends on
+(`agents/base.py`'s `_system_for`). See `docs/BENCHMARKS.md` for this
+machine's own measured before/after numbers, not just the theory.
 
 ## Terminal styling
 
@@ -213,7 +233,9 @@ context/
   truncate.py                heuristic head+tail truncation for text CCE can't compress
 llm/
   ollama_client.py          HTTP client (urllib, stdlib only), generate + generate_stream,
-                            Usage/GenerationResult (real token counts from Ollama)
+                            Usage/GenerationResult (real token counts from Ollama),
+                            context-array reuse, num_batch/num_thread options
+  busy.py                    orphaned-generation detection (advisory lock + GET /api/ps)
   prompts.py                 system/user prompt assembly
 knowledge/loader.py           loads skills/*.md into the system prompt
 skills/                        <- put your own stack rules here as .md files
@@ -232,6 +254,18 @@ webfetch.py                      fetches ```fetch blocks (confirm + HTML-to-text
 websearch.py                      DuckDuckGo HTML scrape for ```search blocks + /search
 gitsafety.py                      auto-commit on confirmed changes, /undo
 security.py                       secret-shaped-string scan on generated content
+scripts/
+  ollama-serve-tuned.sh              tuned Ollama launch script (source of truth --
+                                      install.sh symlinks ~/.local/bin/ to this, not a copy)
+  ollama-tuned.service                 systemd --user unit for the above
+  detect_hardware.py                    CPU/RAM/GPU detection -> tier, stdlib only
+  install.sh                              hardware-tiered setup: config.json, systemd
+                                          service, `localcoder` launcher on PATH
+  bench_ollama.py                         real tok/s + prefill benchmarking across models
+docs/
+  BACKLOG.md                              open/done/deferred work, with reasoning
+  LESSONS_LEARNED.md                       concrete debugging post-mortems
+  BENCHMARKS.md                             dated, real measurements (not guesses)
 tests/                              unittest suite, see "Testing" below
 ```
 
@@ -298,6 +332,20 @@ systemctl --user stop ollama-tuned      # done for now
 | `OLLAMA_MAX_LOADED_MODELS` | `1` | Never hold two models in RAM — matches the earlier finding that swapping between models mid-session is what caused request pile-ups. |
 | `OLLAMA_NUM_PARALLEL` | `1` | One request at a time; this CPU cannot usefully serve concurrent ones anyway (measured: concurrent requests just queue and each pays the full serial cost -- running localcoder in two terminals at once means the second one waits for the first, not a bug, just serial hardware). |
 
+`num_batch`/`num_thread` (`config.json`, defaults `2048`/`2`) are **not**
+env vars, unlike everything in the table above -- verified directly against
+this project's own Ollama 0.33.2 binary (`strings /usr/bin/ollama` shows no
+`OLLAMA_NUM_BATCH`/`OLLAMA_NUM_THREAD` at all). They're per-request
+`options` fields instead, the same mechanism `num_ctx` already uses
+(`llm/ollama_client.py`'s `OllamaClient`) -- confirmed end-to-end by
+inspecting the actual `llama-server` process Ollama spawns: `-b 2048 -ub
+2048 -t 2`, matching the configured values exactly. `num_thread` is
+machine-specific (this machine's 2 physical cores) -- override it in
+`config.json` if you're not on this exact hardware, or set it to `null` to
+let Ollama pick its own default. `scripts/install.sh` sets both
+automatically based on `scripts/detect_hardware.py`'s reading of the
+machine it's run on.
+
 Two models beyond `qwen2.5-coder:7b` are worth keeping installed:
 `qwen3:4b`/`qwen3:8b` are the only ones on this machine confirmed to emit
 Ollama's structured `tool_calls` format reliably, if you ever build something
@@ -306,6 +354,24 @@ and the redundant `qwen-claude:latest` alias were removed when RAM was
 believed to be the binding constraint; worth reconsidering the 14b now that
 the real RAM figure is known, though the CPU -- unchanged -- is still the
 harder limit for a model that size.
+
+## Model selection
+
+`config.json`'s `model` key (if set) always wins. Otherwise, two profiles
+exist in `config.py`'s `model_profiles` (`quality` = `qwen2.5-coder:7b`,
+the default; `fast` = `qwen3:4b`) -- pick one at startup with
+`--profile fast`/`--profile quality`, or override the model directly with
+`--model <name>` (wins over `--profile` too). Switch mid-session with
+`/model <name>`, which also resets any cached context (see "Context reuse"
+above), since a different model invalidates it.
+
+**`qwen3:4b` is not yet a verified `fast` default** -- measured directly
+(`docs/BENCHMARKS.md`, 2026-09-02): its `think: false` request parameter
+did not suppress reasoning output on this Ollama version, burning most of
+a call's time on a hidden `<think>` block even for a trivial question. It
+stays available as an opt-in profile, but promoting it as the automatic
+choice on weak hardware needs that resolved first -- `qwen2.5-coder:7b`
+has no thinking-mode branch at all, so this doesn't affect the default.
 
 ## Security
 
@@ -413,12 +479,15 @@ see `docs/LESSONS_LEARNED.md` for the full investigation):
    closed terminal) -- the `llama-server` subprocess keeps computing at
    ~150-200% CPU until it finishes on its own, and with `OLLAMA_NUM_PARALLEL=1`
    (see "Ollama tuning" below), *every later request queues behind it*,
-   including an unrelated, trivial one in a brand-new session. If `ps`
-   shows a `llama-server` process that's been running far longer than a
-   normal turn should take, kill it (`kill <pid>`) or
-   `systemctl --user restart ollama-tuned` to clear it -- the next request
-   will pay a fresh model-load cost (`OLLAMA_KEEP_ALIVE`, ~15-20s) but won't
-   be stuck behind the old one.
+   including an unrelated, trivial one in a brand-new session. localcoder
+   now checks for exactly this before sending a request (`llm/busy.py`: a
+   host-scoped advisory lock file, `~/.cache/localcoder/inflight.lock`,
+   paired with `GET /api/ps`) and prints a warning naming it instead of
+   just sitting on a silent spinner -- but the underlying wait is still
+   real, this only makes it legible. If it happens, kill the orphaned
+   process (`kill <pid>`) or `systemctl --user restart ollama-tuned` to
+   clear it -- the next request will pay a fresh model-load cost
+   (`OLLAMA_KEEP_ALIVE`, ~15-20s) but won't be stuck behind the old one.
 
 ## Limitations (measured on this hardware, not assumed)
 
@@ -428,10 +497,15 @@ see `docs/LESSONS_LEARNED.md` for the full investigation):
   for this reason. See "Ollama tuning" above for what's already been done to
   keep this from being worse than it has to be — there is no further config
   change that fixes a 2017 dual-core CPU.
-- **No conversation memory across turns yet.** Each turn is a fresh
-  `generate()` call with fresh context assembly. Cheap and predictable, but
-  it means "no, the other file" won't work — be explicit each time, or use
-  `/files` to pin what's relevant before asking.
+- **No conversation memory across turns, still.** Each turn is a fresh
+  `generate()` call with fresh context assembly — "no, the other file"
+  won't work; be explicit each time, or use `/files` to pin what's
+  relevant. What *did* change: turns within the same session now reuse
+  Ollama's `context` token array from the previous turn purely to skip
+  re-prefilling the (identical) system prompt from zero -- see "Context
+  reuse" below. That's a prefill-speed optimization, not memory: the model
+  still receives no summary of what you asked before, only a cached prefix
+  it doesn't have to re-read.
 - **Context budget is still a char cap** (`max_total_context_chars`), not an
   exact token count — no tokenizer library exists in this project by design
   (stdlib only). It's now *derived* from `num_ctx` (`config.py`'s
