@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import unittest
 from unittest import mock
@@ -57,6 +59,25 @@ class TestUsageBar(unittest.TestCase):
         with mock.patch("ui._enabled", return_value=False):
             bar = ui.usage_bar(0, 0, 0)
         self.assertIn("0/0", bar)
+
+
+class TestConfirm(unittest.TestCase):
+    def test_y_confirms(self):
+        with mock.patch("builtins.input", return_value="Y"):
+            self.assertTrue(ui.confirm("do it?"))
+
+    def test_anything_else_declines(self):
+        for answer in ("n", "", "yes", "sure", "  N  "):
+            with mock.patch("builtins.input", return_value=answer):
+                self.assertFalse(ui.confirm("do it?"), answer)
+
+    def test_eof_is_no_and_never_raises(self):
+        buffer = io.StringIO()
+        with mock.patch("builtins.input", side_effect=EOFError), \
+             mock.patch("ui._enabled", return_value=False), \
+             contextlib.redirect_stdout(buffer):
+            self.assertFalse(ui.confirm("do it?"))
+        self.assertIn("assumido 'n'", buffer.getvalue())
 
 
 class TestSpinner(unittest.TestCase):

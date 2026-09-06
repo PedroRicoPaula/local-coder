@@ -72,7 +72,14 @@ def sub(msg: str) -> None:
 
 
 def confirm(prompt: str) -> bool:
-    answer = input(f"{bold(prompt)} [y/N] ").strip().lower()
+    """EOF is "no", never "yes". A piped/non-interactive run that runs out of
+    input must decline cleanly instead of ending the process with a
+    traceback -- and it must never be able to auto-approve."""
+    try:
+        answer = input(f"{bold(prompt)} [y/N] ").strip().lower()
+    except EOFError:
+        print("  (sem entrada disponível -- assumido 'n')", flush=True)
+        return False
     return answer == "y"
 
 
