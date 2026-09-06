@@ -108,6 +108,32 @@ class TestUndoLast(unittest.TestCase):
             self.assertTrue(ok, message)
             self.assertFalse(Path(root, "a.py").exists())
 
+    def test_head_lookup_failure_after_revert_still_reports_success(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "README.md").write_text("preexisting\n")
+            subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+            Path(root, "a.py").write_text("x = 1\n")
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
+            before = _count_commits(root)
+
+            real_git = gitsafety._git
+
+            def fail_head_lookup(project_root, args, timeout=10):
+                if args == ["rev-parse", "--short", "HEAD"]:
+                    raise subprocess.TimeoutExpired(["git", *args], timeout)
+                return real_git(project_root, args, timeout)
+
+            with mock.patch.object(gitsafety, "_git", side_effect=fail_head_lookup):
+                ok, message = gitsafety.undo_last(root)
+
+            self.assertTrue(ok, message)
+            self.assertEqual(message, "reverted: localcoder: write a.py")
+            self.assertEqual(_count_commits(root), before + 1)
+            self.assertFalse(Path(root, "a.py").exists())
+            self.assertTrue(Path(root, "README.md").exists())
+
     def test_undo_refuses_when_an_affected_path_is_dirty(self):
         with tempfile.TemporaryDirectory() as root:
             _init_repo(root)

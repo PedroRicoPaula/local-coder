@@ -121,10 +121,14 @@ def undo_last(project_root: str) -> tuple[bool, str]:
 
         result = _git(project_root, ["revert", "--no-edit", "--no-rerere-autoupdate", sha], 30)
         if result.returncode == 0:
-            head = _git(project_root, ["rev-parse", "--short", "HEAD"], 5)
+            message = f"reverted: {subject}"
+            try:
+                head = _git(project_root, ["rev-parse", "--short", "HEAD"], 5)
+            except (OSError, subprocess.TimeoutExpired):
+                return True, message
             new_sha = head.stdout.strip()
             suffix = f" (new commit {new_sha})" if head.returncode == 0 and new_sha else ""
-            return True, f"reverted: {subject}{suffix}"
+            return True, f"{message}{suffix}"
 
         marker = _git(project_root, ["rev-parse", "--git-path", "REVERT_HEAD"], 5)
         marker_path = Path(project_root, marker.stdout.strip())
