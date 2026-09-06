@@ -1,12 +1,11 @@
-"""Runs a shell command the model asked for, always behind confirmation.
+"""Runs model shell commands and trusted local argv commands.
 
-A short denylist refuses outright -- no prompt at all -- for patterns with
-no legitimate reason to appear in a coding task and every reason to be
-catastrophic if run by accident. This is mitigation, not a promise, same
-spirit as context/denylist.py: everything else still needs an explicit y/N,
-which is the real gate. Matches the standard guidance for agentic CLIs
-(OWASP's AI Agent Security Cheat Sheet): never grant blanket execution,
-always require approval for anything with real-world effect.
+Model-emitted strings use shell=True and a short denylist; deterministic
+argument vectors built by localcoder use shell=False so metacharacters remain
+literal. Confirmation belongs to the calling layer (apply_run for model
+commands and verification.py for argv). The denylist is mitigation, not a
+promise: explicit y/N confirmation remains the real gate, matching OWASP's
+guidance for agentic CLIs.
 """
 from __future__ import annotations
 
@@ -24,6 +23,8 @@ import ui
 
 MAX_OUTPUT_CHARS = 4000
 TIMEOUT_S = 120
+PIPE_DRAIN_S = 0.25
+REAP_TIMEOUT_S = 0.5
 
 _DENIED_PATTERNS = [
     re.compile(r"rm\s+-[a-z]*r[a-z]*f|rm\s+-[a-z]*f[a-z]*r"),  # rm -rf, -fr, etc
@@ -93,6 +94,39 @@ def _kill_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _close_pipes(proc: subprocess.Popen) -> None:
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None and not pipe.closed:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+
+
+def _reap_bounded(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.wait(timeout=REAP_TIMEOUT_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _partial_text(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value or ""
+
+
 def _capture(
     command,
     *,
@@ -128,11 +162,30 @@ def _capture(
 
     timed_out = False
     try:
-        stdout, stderr = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        timed_out = True
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired as timeout:
+            timed_out = True
+            stdout = _partial_text(timeout.output)
+            stderr = _partial_text(timeout.stderr)
+            _kill_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=PIPE_DRAIN_S)
+            except subprocess.TimeoutExpired as cleanup_timeout:
+                # communicate() reports cumulative output, so replace rather
+                # than append when a bounded drain captured anything further.
+                if cleanup_timeout.output is not None:
+                    stdout = _partial_text(cleanup_timeout.output)
+                if cleanup_timeout.stderr is not None:
+                    stderr = _partial_text(cleanup_timeout.stderr)
+                _reap_bounded(proc)
+    except BaseException:
         _kill_group(proc)
-        stdout, stderr = proc.communicate()
+        _close_pipes(proc)
+        _reap_bounded(proc)
+        raise
+    finally:
+        _close_pipes(proc)
 
     stdout, stderr = stdout or "", stderr or ""
     if timed_out:

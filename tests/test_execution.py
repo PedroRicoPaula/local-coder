@@ -1,6 +1,11 @@
+import os
+import signal
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import execution
@@ -112,6 +117,75 @@ class TestRunArgv(unittest.TestCase):
             time.sleep(0.1)
         else:
             self.fail("the SIGTERM-ignoring grandchild survived")
+
+    def test_keyboard_interrupt_kills_group_reaps_and_closes_pipes(self):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            with (
+                mock.patch("execution.subprocess.Popen", return_value=proc),
+                mock.patch.object(proc, "communicate", side_effect=KeyboardInterrupt),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    execution.run_argv("/tmp", ["ignored"], timeout_s=10)
+
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(proc.stdout.closed)
+            self.assertTrue(proc.stderr.closed)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+            if proc.stdout and not proc.stdout.closed:
+                proc.stdout.close()
+            if proc.stderr and not proc.stderr.closed:
+                proc.stderr.close()
+
+    def test_timeout_does_not_wait_for_escaped_pipe_holder(self):
+        escaped_pid = None
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root, "escaped.pid")
+            child_code = (
+                "import os,time,pathlib;"
+                "os.setsid();"
+                f"pathlib.Path({str(marker)!r}).write_text(str(os.getpid()));"
+                "time.sleep(6)"
+            )
+            parent_code = (
+                "import pathlib,subprocess,sys,time;"
+                f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]);"
+                f"marker=pathlib.Path({str(marker)!r});"
+                "deadline=time.monotonic()+3;"
+                "\nwhile not marker.exists() and time.monotonic()<deadline: time.sleep(.01)"
+                "\nprint(p.pid, flush=True); time.sleep(30)"
+            )
+            start = time.monotonic()
+            try:
+                result = execution.run_argv(
+                    root, [sys.executable, "-c", parent_code], timeout_s=1
+                )
+                elapsed = time.monotonic() - start
+                escaped_pid = int(marker.read_text())
+                self.assertIs(result.status, execution.Status.TIMEOUT)
+                self.assertLess(elapsed, 5)
+                self.assertIn(str(escaped_pid), result.stdout)
+            finally:
+                if escaped_pid is None and marker.exists():
+                    escaped_pid = int(marker.read_text())
+                if escaped_pid is not None and not _dead_or_zombie(escaped_pid):
+                    try:
+                        os.kill(escaped_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    for _ in range(30):
+                        if _dead_or_zombie(escaped_pid):
+                            break
+                        time.sleep(0.1)
 
     def test_fields_populated_for_ok_and_failed(self):
         ok = execution.run_argv(

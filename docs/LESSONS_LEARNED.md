@@ -184,3 +184,22 @@ into a confusing double failure. Also: `git diff-tree` needs `--root` or a
 root commit reports zero changed paths, and reverting a root commit works
 fine, so the old "can't auto-undo the repo's very first commit" refusal was
 an artifact of `reset --hard`, not a git limitation.
+
+## Process-group termination and pipe cleanup are separate timeout problems
+
+**Symptom risk**: killing only a timed-out command's direct process leaves
+grandchildren running. Even after signaling the whole group, an unbounded
+second `communicate()` can still hang if a descendant called `setsid()` and
+kept inherited stdout/stderr open. A `KeyboardInterrupt` during
+`communicate()` can take a third path, skipping ordinary timeout cleanup and
+leaving both the private group and local pipe handles behind.
+
+**Takeaway**: start each command in a private session and signal the known
+group ID derived at launch, never a newly looked-up group after a race.
+Escalate from `SIGTERM` to `SIGKILL` for grandchildren that ignore the first
+signal. Treat pipe draining as a distinct, bounded best-effort step: preserve
+`TimeoutExpired`'s cumulative partial output, but close local pipe handles and
+reap within fixed cleanup deadlines instead of waiting forever for EOF from an
+escaped pipe holder. On `BaseException`, perform the same group kill,
+close, and bounded reap before re-raising so the CLI's existing Ctrl-C handler
+still owns user-facing behavior.
