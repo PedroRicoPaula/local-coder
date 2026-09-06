@@ -15,9 +15,11 @@ import shlex
 import shutil
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+import execution
+import ui
 from context import tree
 from context.truncate import truncate_text
 from execution import CommandResult, Status
@@ -246,3 +248,58 @@ def failure_feedback(outcome: VerificationOutcome) -> str:
         "Do not run commands, do not fetch, do not search.",
         "--- END VERIFICATION RESULT ---",
     ])
+
+
+_NO_TESTS_KINDS = ("unittest", "pytest")
+
+
+def _report(command: VerificationCommand, result: CommandResult) -> None:
+    if result.status is Status.OK:
+        ui.success("verification passed")
+        return
+    if result.status is Status.NO_TESTS:
+        ui.warn("verification ran no tests")
+        return
+    if result.status is Status.TIMEOUT:
+        ui.error(f"verification timed out after {result.timeout_s}s")
+    elif result.status is Status.LAUNCH_ERROR:
+        ui.error(f"verification could not start: {result.stderr.strip()}")
+    else:
+        ui.error(f"verification failed (exit {result.exit_code})")
+    for line in extract_failure_context(result.stdout, result.stderr).splitlines():
+        ui.sub(line)
+
+
+def verify_project(project_root: str, changed_paths: Sequence[str], cfg: VerifyConfig,
+                   *, confirm: bool = True) -> VerificationOutcome:
+    """Run the discovered command once, behind its own y/N.
+
+    There is no once-per-session blanket approval and no --yes flag: every
+    single execution is confirmed separately.
+    """
+    if not cfg.enabled:
+        return VerificationOutcome(False, None, None, "verification disabled in config")
+
+    command = discover(project_root, changed_paths, cfg.override_argv)
+    if command is None:
+        return VerificationOutcome(False, None, None, "no verification command for this project")
+
+    ui.info(f"verification: {command.label} (timeout {cfg.timeout_s}s)")
+    if confirm and not ui.confirm(f"  run verification `{command.label}`?"):
+        declined = CommandResult(
+            kind="argv", display=command.label, status=Status.DECLINED, exit_code=None,
+            stdout="", stderr="", duration_s=0.0, timeout_s=cfg.timeout_s, truncated=False,
+        )
+        return VerificationOutcome(False, command, declined, "verification declined")
+
+    result = execution.run_argv(project_root, command.argv, cfg.timeout_s)
+    # Measured: `unittest discover` exits 5 when it collects nothing, and
+    # pytest uses the same code for "no tests collected". execution.py cannot
+    # know a tool's exit-code semantics, so the reclassification lives here
+    # and applies to those two kinds only.
+    if (result.status is Status.FAILED and result.exit_code == 5
+            and command.kind in _NO_TESTS_KINDS):
+        result = replace(result, status=Status.NO_TESTS)
+
+    _report(command, result)
+    return VerificationOutcome(True, command, result, "")

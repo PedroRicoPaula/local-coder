@@ -225,5 +225,89 @@ class TestFailureFeedback(unittest.TestCase):
         self.assertIn("partial output", text)
 
 
+class TestVerifyProject(unittest.TestCase):
+    def _cfg(self, enabled=True, timeout_s=180, override_argv=None):
+        return verification.VerifyConfig(
+            enabled=enabled, timeout_s=timeout_s, override_argv=override_argv
+        )
+
+    def test_disabled_config_runs_nothing(self):
+        with mock.patch("execution.run_argv", side_effect=AssertionError("must not run")):
+            outcome = verification.verify_project("/tmp", [], self._cfg(enabled=False))
+        self.assertFalse(outcome.ran)
+        self.assertEqual(outcome.skip_reason, "verification disabled in config")
+
+    def test_unsupported_project_reports_and_runs_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("execution.run_argv", side_effect=AssertionError("must not run")):
+                outcome = verification.verify_project(root, [], self._cfg())
+        self.assertFalse(outcome.ran)
+        self.assertEqual(outcome.skip_reason, "no verification command for this project")
+
+    def test_declined_never_executes_anything(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write(root, "app.py", "x = 1\n")
+            with mock.patch("execution.run_argv", side_effect=AssertionError("must not run")), \
+                 mock.patch("builtins.input", return_value="n"), \
+                 mock.patch("ui._enabled", return_value=False):
+                outcome = verification.verify_project(root, [], self._cfg())
+        self.assertFalse(outcome.ran)
+        self.assertEqual(outcome.skip_reason, "verification declined")
+        self.assertIs(outcome.result.status, Status.DECLINED)
+        self.assertFalse(outcome.needs_repair)
+
+    def test_every_execution_is_confirmed_separately(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write(root, "app.py", "x = 1\n")
+            with mock.patch("builtins.input", return_value="y") as prompt, \
+                 mock.patch("ui._enabled", return_value=False):
+                verification.verify_project(root, [], self._cfg())
+                verification.verify_project(root, [], self._cfg())
+            self.assertEqual(prompt.call_count, 2)
+
+    def test_passing_run_reports_ok(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write(root, "app.py", "x = 1\n")
+            with mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("ui._enabled", return_value=False):
+                outcome = verification.verify_project(root, ["app.py"], self._cfg())
+        self.assertTrue(outcome.ran)
+        self.assertIs(outcome.result.status, Status.OK)
+        self.assertFalse(outcome.needs_repair)
+
+    def test_failing_run_needs_repair(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write(root, "broken.py", "def f(:\n")
+            with mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("ui._enabled", return_value=False):
+                outcome = verification.verify_project(root, ["broken.py"], self._cfg())
+        self.assertTrue(outcome.ran)
+        self.assertIs(outcome.result.status, Status.FAILED)
+        self.assertTrue(outcome.needs_repair)
+
+    def test_exit_five_is_no_tests_for_unittest(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write(root, "test_empty.py", "# no test cases at all\n")
+            with mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("ui._enabled", return_value=False):
+                outcome = verification.verify_project(root, [], self._cfg())
+        self.assertEqual(outcome.command.kind, "unittest")
+        self.assertIs(outcome.result.status, Status.NO_TESTS)
+        self.assertFalse(outcome.needs_repair)
+
+    def test_exit_five_stays_failed_for_other_kinds(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("ui._enabled", return_value=False):
+                outcome = verification.verify_project(
+                    root, [], self._cfg(
+                        override_argv=[sys.executable, "-c", "raise SystemExit(5)"]
+                    )
+                )
+        self.assertEqual(outcome.command.kind, "override")
+        self.assertIs(outcome.result.status, Status.FAILED)
+        self.assertTrue(outcome.needs_repair)
+
+
 if __name__ == "__main__":
     unittest.main()

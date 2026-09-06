@@ -203,3 +203,17 @@ reap within fixed cleanup deadlines instead of waiting forever for EOF from an
 escaped pipe holder. On `BaseException`, perform the same group kill,
 close, and bounded reap before re-raising so the CLI's existing Ctrl-C handler
 still owns user-facing behavior.
+
+## Exit code 5 from `unittest`/`pytest` means "no tests", not "failure"
+
+**Symptom risk**: `python3 -m unittest discover -q` in a directory with no
+test cases exits **5** ("NO TESTS RAN"), and pytest uses the same code for
+"no tests collected". Treating any non-zero exit as a failure would fire a
+pointless repair call -- an extra multi-minute model call on CPU-only
+hardware -- every time localcoder touched a project that has no tests yet.
+
+**Takeaway**: exit-code semantics are per-tool, so the reclassification
+belongs in the layer that knows which tool ran (`verification.py`), not in
+the generic runner (`execution.py`). Only `unittest` and `pytest` get the
+special case; a `LAUNCH_ERROR` (missing toolchain) is likewise reported but
+never treated as a code defect the model can fix.
