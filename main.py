@@ -177,6 +177,103 @@ def stream_and_print(chunks: Iterator[dict]) -> tuple[str, Usage | None, list[in
     return "".join(response_parts), usage, kv_context
 
 
+def _append_result(
+    task: str,
+    current_task: str,
+    results: list[str],
+    max_total_context_chars: int,
+    num_ctx: int,
+    kv_context: list[int] | None,
+) -> tuple[str, str, list[int] | None]:
+    """Returns (new current_task, delta to send, kv_context or None).
+
+    Exactly the pre-existing hop-budget logic, extracted: append when it
+    fits; otherwise warn, rebuild current_task from `task` plus the most
+    recent result only, and drop the cached kv_context because it covers
+    text we just dropped. `delta` is only meaningful when the returned
+    kv_context survives; the caller sends `current_task` instead whenever it
+    comes back None."""
+    appended = (
+        "\n\n--- RESULT OF YOUR LAST ACTION ---\n"
+        + "\n\n".join(results)
+        + "\n--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
+    )
+    if len(current_task) + len(appended) > max_total_context_chars:
+        ui.warn(
+            f"contexto acumulado dos follow-ups excede o orçamento seguro em tokens "
+            f"({max_total_context_chars} chars, derivado de num_ctx={num_ctx}) -- "
+            f"a descartar histórico mais antigo, mantendo só o resultado mais recente"
+        )
+        rebuilt = (
+            f"{task}\n\n--- RESULT OF YOUR LAST ACTION ---\n"
+            f"{truncate_text(results[-1], max_chars=max_total_context_chars // 2)}\n"
+            "--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
+        )
+        return rebuilt, appended, None
+    return current_task + appended, appended, kv_context
+
+
+def _apply_blocks(output: str, project_root: str, cce: CCEClient,
+                  mutated: list[str]) -> list[str]:
+    """Applies every block in `output` in today's order (writes, deletes,
+    shell suggestions, edits, malformed edits, runs, fetches, searches,
+    symbols), appends each successfully mutated relative path to `mutated`,
+    and returns the truncated action results that would feed a follow-up
+    hop."""
+    def track(path: str) -> None:
+        if path not in mutated:
+            mutated.append(path)
+
+    for write in actions.extract_writes(output):
+        if actions.apply_write(project_root, write):
+            track(write.path)
+    for path in actions.extract_deletes(output):
+        if actions.apply_delete(project_root, path):
+            track(path)
+    for cmd in actions.extract_shell_suggestions(output):
+        ui.info(f"suggested command -- not run automatically:\n  $ {cmd}")
+
+    action_results: list[str] = []
+    for edit in actions.extract_edits(output):
+        result = actions.apply_edit(project_root, edit)
+        if result.ok:
+            track(edit.path)
+        if result.error:
+            action_results.append(truncate_text(result.error))
+    for bad in actions.extract_malformed_edits(output):
+        action_results.append(truncate_text(actions.format_action_error(
+            action="edit",
+            reason="edit block is not a valid SEARCH/REPLACE pair",
+            path=bad.path,
+            suggestion=(
+                "use exactly:\n<<<<<<< SEARCH\n<the old lines>\n=======\n"
+                "<the new lines>\n>>>>>>> REPLACE"
+            ),
+        )))
+    for cmd in actions.extract_runs(output):
+        result = execution.apply_run(project_root, cmd)
+        if result:
+            action_results.append(truncate_text(result))
+    for url in actions.extract_fetches(output):
+        result = webfetch.apply_fetch(url)
+        if result:
+            action_results.append(truncate_text(result))
+    for query in actions.extract_searches(output):
+        result = websearch.apply_search(query)
+        if result:
+            action_results.append(truncate_text(result))
+    for path, symbol in actions.extract_symbol_requests(output):
+        if not cce.available:
+            ui.warn(f"pedido get_symbol({path}, {symbol}) mas o CCE não está ligado -- a ignorar")
+            continue
+        snippet = cce.get_symbol(path, symbol)
+        action_results.append(
+            truncate_text(snippet) if snippet
+            else f"get_symbol: símbolo `{symbol}` não encontrado em {path}"
+        )
+    return action_results
+
+
 def run_turn(
     agent: Agent,
     task: str,
@@ -244,48 +341,8 @@ def run_turn(
 
         print_usage_summary(usage, num_ctx)
 
-        for write in actions.extract_writes(output):
-            actions.apply_write(project_root, write)
-        for path in actions.extract_deletes(output):
-            actions.apply_delete(project_root, path)
-        for cmd in actions.extract_shell_suggestions(output):
-            ui.info(f"suggested command -- not run automatically:\n  $ {cmd}")
-
-        action_results: list[str] = []
-        for edit in actions.extract_edits(output):
-            result = actions.apply_edit(project_root, edit)
-            if result.error:
-                action_results.append(truncate_text(result.error))
-        for bad in actions.extract_malformed_edits(output):
-            action_results.append(truncate_text(actions.format_action_error(
-                action="edit",
-                reason="edit block is not a valid SEARCH/REPLACE pair",
-                path=bad.path,
-                suggestion=(
-                    "use exactly:\n<<<<<<< SEARCH\n<the old lines>\n=======\n"
-                    "<the new lines>\n>>>>>>> REPLACE"
-                ),
-            )))
-        for cmd in actions.extract_runs(output):
-            result = execution.apply_run(project_root, cmd)
-            if result:
-                action_results.append(truncate_text(result))
-        for url in actions.extract_fetches(output):
-            result = webfetch.apply_fetch(url)
-            if result:
-                action_results.append(truncate_text(result))
-        for query in actions.extract_searches(output):
-            result = websearch.apply_search(query)
-            if result:
-                action_results.append(truncate_text(result))
-        for path, symbol in actions.extract_symbol_requests(output):
-            if not cce.available:
-                ui.warn(f"pedido get_symbol({path}, {symbol}) mas o CCE não está ligado -- a ignorar")
-                continue
-            snippet = cce.get_symbol(path, symbol)
-            action_results.append(
-                truncate_text(snippet) if snippet else f"get_symbol: símbolo `{symbol}` não encontrado em {path}"
-            )
+        mutated_this_hop: list[str] = []
+        action_results = _apply_blocks(output, project_root, cce, mutated_this_hop)
 
         if not action_results:
             return hop_kv_context
@@ -293,32 +350,9 @@ def run_turn(
             ui.info(f"follow-up limit reached ({MAX_FOLLOWUP_TURNS}) -- stopping here")
             return hop_kv_context
 
-        appended = (
-            f"\n\n--- RESULT OF YOUR LAST ACTION ---\n"
-            + "\n\n".join(action_results)
-            + "\n--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
+        current_task, appended, hop_kv_context = _append_result(
+            task, current_task, action_results, max_total_context_chars, num_ctx, hop_kv_context,
         )
-        if len(current_task) + len(appended) > max_total_context_chars:
-            ui.warn(
-                f"contexto acumulado dos follow-ups excede o orçamento seguro em tokens "
-                f"({max_total_context_chars} chars, derivado de num_ctx={num_ctx}) -- "
-                f"a descartar histórico mais antigo, mantendo só o resultado mais recente"
-            )
-            current_task = (
-                f"{task}\n\n--- RESULT OF YOUR LAST ACTION ---\n"
-                f"{truncate_text(action_results[-1], max_chars=max_total_context_chars // 2)}\n"
-                "--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
-            )
-            # The cached prefix (hop_kv_context) covers the *dropped* history
-            # too -- once older hops are discarded, "resend just the delta"
-            # no longer means the same thing (the delta would land on top of
-            # a prefix that includes text we just chose to drop from
-            # `current_task`). Fall back to a clean, uncached resend of the
-            # freshly-rebuilt current_task next hop rather than risk sending
-            # a confusing/duplicated prompt.
-            hop_kv_context = None
-        else:
-            current_task += appended
     return hop_kv_context
 
 

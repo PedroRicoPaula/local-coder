@@ -340,5 +340,55 @@ class TestResolveModelConfig(unittest.TestCase):
         self.assertEqual(cfg["model"], "qwen2.5-coder:7b")
 
 
+class TestAppendResultHelper(unittest.TestCase):
+    def test_fits_budget_keeps_the_cache_and_grows_the_task(self):
+        new_task, delta, kv = main._append_result(
+            "task", "task", ["RESULT"], max_total_context_chars=100_000,
+            num_ctx=8192, kv_context=[1, 2],
+        )
+        self.assertIn("RESULT OF YOUR LAST ACTION", delta)
+        self.assertIn("RESULT", delta)
+        self.assertEqual(new_task, "task" + delta)
+        self.assertEqual(kv, [1, 2])
+
+    def test_over_budget_drops_history_and_the_cache(self):
+        with mock.patch("ui._enabled", return_value=False):
+            new_task, delta, kv = main._append_result(
+                "task", "task" + "x" * 500, ["NEWEST"], max_total_context_chars=200,
+                num_ctx=8192, kv_context=[1, 2],
+            )
+        self.assertIsNone(kv)
+        self.assertTrue(new_task.startswith("task"))
+        self.assertIn("NEWEST", new_task)
+        self.assertNotIn("x" * 500, new_task)
+
+
+class TestApplyBlocksHelper(unittest.TestCase):
+    def test_tracks_mutated_paths_and_returns_action_results(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "old.py").write_text("bye\n")
+            output = (
+                "```write:new.py\nprint('hi')\n```\n"
+                "```delete:old.py\n```\n"
+                "```edit:missing.py\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```"
+            )
+            mutated: list[str] = []
+            with mock.patch("ui._enabled", return_value=False), \
+                 mock.patch("builtins.input", return_value="y"):
+                results = main._apply_blocks(output, root, _FakeCCE(available=False), mutated)
+            self.assertEqual(mutated, ["new.py", "old.py"])
+            self.assertEqual(len(results), 1)
+            self.assertIn("does not exist", results[0])
+
+    def test_declined_write_is_not_tracked_as_mutated(self):
+        with tempfile.TemporaryDirectory() as root:
+            mutated: list[str] = []
+            with mock.patch("ui._enabled", return_value=False), \
+                 mock.patch("builtins.input", return_value="n"):
+                main._apply_blocks("```write:new.py\nx\n```", root,
+                                   _FakeCCE(available=False), mutated)
+            self.assertEqual(mutated, [])
+
+
 if __name__ == "__main__":
     unittest.main()
