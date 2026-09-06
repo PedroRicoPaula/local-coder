@@ -121,12 +121,22 @@ def undo_last(project_root: str) -> tuple[bool, str]:
 
         result = _git(project_root, ["revert", "--no-edit", "--no-rerere-autoupdate", sha], 30)
         if result.returncode == 0:
-            return True, f"reverted: {subject} (new commit {sha[:7]})"
+            head = _git(project_root, ["rev-parse", "--short", "HEAD"], 5)
+            new_sha = head.stdout.strip()
+            suffix = f" (new commit {new_sha})" if head.returncode == 0 and new_sha else ""
+            return True, f"reverted: {subject}{suffix}"
 
         marker = _git(project_root, ["rev-parse", "--git-path", "REVERT_HEAD"], 5)
-        if marker.returncode == 0 and Path(project_root, marker.stdout.strip()).exists():
-            _git(project_root, ["revert", "--abort"], 30)
-            return False, f"revert conflicted and was rolled back -- resolve {subject} by hand"
+        marker_path = Path(project_root, marker.stdout.strip())
+        if marker.returncode == 0 and marker_path.exists():
+            abort = _git(project_root, ["revert", "--abort"], 30)
+            if abort.returncode == 0 and not marker_path.exists():
+                return False, f"revert conflicted and was rolled back -- resolve {subject} by hand"
+            return False, (
+                "revert conflicted and cleanup could not be confirmed; the repository "
+                "may still have a revert in progress -- inspect git status and run "
+                "git revert --abort"
+            )
         first_line = (result.stderr.strip().splitlines() or [""])[0]
         return False, f"git refused the revert: {first_line}"
     except (OSError, subprocess.TimeoutExpired) as e:

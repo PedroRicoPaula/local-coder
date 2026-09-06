@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import gitsafety
 
@@ -89,6 +90,11 @@ class TestUndoLast(unittest.TestCase):
             ok, message = gitsafety.undo_last(root)
             self.assertTrue(ok, message)
             self.assertEqual(_count_commits(root), before + 1)
+            new_head = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=root, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            self.assertIn(f"(new commit {new_head})", message)
             self.assertFalse(Path(root, "a.py").exists())
             self.assertTrue(Path(root, "README.md").exists())
 
@@ -142,6 +148,40 @@ class TestUndoLast(unittest.TestCase):
                                     cwd=root, capture_output=True, text=True, check=True)
             self.assertNotIn("UU", status.stdout)
             self.assertEqual(Path(root, "a.py").read_text(), "line1\nHUMAN AGAIN\nline3\n")
+
+    def test_abort_failure_never_claims_conflict_was_rolled_back(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("line1\nline2\nline3\n")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+
+            Path(root, "a.py").write_text("line1\nLOCALCODER\nline3\n")
+            gitsafety.commit_change(root, "edit a.py", ["a.py"])
+            Path(root, "a.py").write_text("line1\nHUMAN AGAIN\nline3\n")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "my own change"], cwd=root, check=True)
+
+            real_git = gitsafety._git
+
+            def fail_abort(project_root, args, timeout=10):
+                if args == ["revert", "--abort"]:
+                    return subprocess.CompletedProcess(
+                        ["git", *args], 1, "", "simulated abort failure",
+                    )
+                return real_git(project_root, args, timeout)
+
+            with mock.patch.object(gitsafety, "_git", side_effect=fail_abort):
+                ok, message = gitsafety.undo_last(root)
+
+            self.assertFalse(ok)
+            self.assertNotIn("was rolled back", message)
+            self.assertIn("may still have a revert in progress", message)
+            marker = subprocess.run(
+                ["git", "rev-parse", "--git-path", "REVERT_HEAD"],
+                cwd=root, capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            self.assertTrue(Path(root, marker).exists())
 
     def test_undo_refuses_a_human_commit(self):
         with tempfile.TemporaryDirectory() as root:
