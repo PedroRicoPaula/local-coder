@@ -20,6 +20,12 @@ trigger condition actually happens.
 
 ## Done
 
+- **macOS install path** (`scripts/install.sh`, `scripts/detect_hardware.py`).
+  Darwin no longer exits for missing systemd. Apple Silicon is the `gpu`
+  tier (Metal). Killpg tests use a POSIX liveness helper instead of
+  `/proc/<pid>/stat`. See
+  `docs/superpowers/specs/2026-09-06-macos-support-design.md`.
+
 - **Slice B: deterministic verification -> repair** (`verification.py`,
   `execution.py`, `config.py`, `main.py`). After a mutation, localcoder runs
   the project's own check command -- discovered with filesystem checks only
