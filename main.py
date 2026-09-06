@@ -19,6 +19,7 @@ import config
 import execution
 import gitsafety
 import ui
+import verification
 import webfetch
 import websearch
 from agents.base import Agent
@@ -27,7 +28,8 @@ from agents.registry import AgentRegistry
 from config import load_config
 from context.cce_client import CCEClient
 from context.denylist import is_denied
-from context.tree import build_tree, list_source_files
+from context.relevance import ScoredFile, format_selection, select_files_for_task
+from context.tree import build_tree
 from context.truncate import truncate_text
 from knowledge.loader import load_skills
 from llm import busy
@@ -35,17 +37,24 @@ from llm.ollama_client import OllamaClient, OllamaError, Usage
 from llm.prompts import build_user_prompt
 
 MAX_FOLLOWUP_TURNS = 2
+MAX_REPAIR_HOPS = 1  # NOT configurable: this is the one bound preventing an
+                     # unbounded fix/verify loop, and there is no evidence a
+                     # second hop helps a 7B model.
 NEAR_LIMIT_FRACTION = 0.98  # prompt_eval_count / num_ctx above this -> warn
 
 BANNER = """localcoder -- local, offline coding assistant (qwen2.5-coder via Ollama)
 Type an instruction, or one of:
   /files <a.py> <b.py>   pin specific files as context for the next turn
+  /context               show how the last turn's file context was chosen
+  /why                   same as /context (scores + budget)
+  /verify                run this project's test/check command (discovered, confirmed)
   /agent <name> <task>   run a sub-agent once (test, refactor)
   /agents                list available sub-agents
   /model <name>          switch model for this session (e.g. qwen3:4b)
   /search <query>        search the web (only if online), shown here directly
   /undo                  revert the last change localcoder committed (git repos only)
   /tree                  reprint the project tree
+  /help                  reprint this list
   /quit                  exit
 """
 
@@ -172,6 +181,118 @@ def stream_and_print(chunks: Iterator[dict]) -> tuple[str, Usage | None, list[in
     return "".join(response_parts), usage, kv_context
 
 
+def _append_result(
+    task: str,
+    current_task: str,
+    results: list[str],
+    max_total_context_chars: int,
+    num_ctx: int,
+    kv_context: list[int] | None,
+) -> tuple[str, str, list[int] | None]:
+    """Returns (new current_task, delta to send, kv_context or None).
+
+    Exactly the pre-existing hop-budget logic, extracted: append when it
+    fits; otherwise warn, rebuild current_task from `task` plus the most
+    recent result only, and drop the cached kv_context because it covers
+    text we just dropped. `delta` is only meaningful when the returned
+    kv_context survives; the caller sends `current_task` instead whenever it
+    comes back None."""
+    appended = (
+        "\n\n--- RESULT OF YOUR LAST ACTION ---\n"
+        + "\n\n".join(results)
+        + "\n--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
+    )
+    if len(current_task) + len(appended) > max_total_context_chars:
+        ui.warn(
+            f"contexto acumulado dos follow-ups excede o orçamento seguro em tokens "
+            f"({max_total_context_chars} chars, derivado de num_ctx={num_ctx}) -- "
+            f"a descartar histórico mais antigo, mantendo só o resultado mais recente"
+        )
+        rebuilt = (
+            f"{task}\n\n--- RESULT OF YOUR LAST ACTION ---\n"
+            f"{truncate_text(results[-1], max_chars=max_total_context_chars // 2)}\n"
+            "--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
+        )
+        return rebuilt, appended, None
+    return current_task + appended, appended, kv_context
+
+
+def _apply_blocks(output: str, project_root: str, cce: CCEClient,
+                  mutated: list[str]) -> list[str]:
+    """Applies every block in `output` in today's order (writes, deletes,
+    shell suggestions, edits, malformed edits, runs, fetches, searches,
+    symbols), appends each successfully mutated relative path to `mutated`,
+    and returns the truncated action results that would feed a follow-up
+    hop."""
+    def track(path: str) -> None:
+        if path not in mutated:
+            mutated.append(path)
+
+    for write in actions.extract_writes(output):
+        if actions.apply_write(project_root, write):
+            track(write.path)
+    for path in actions.extract_deletes(output):
+        if actions.apply_delete(project_root, path):
+            track(path)
+    for cmd in actions.extract_shell_suggestions(output):
+        ui.info(f"suggested command -- not run automatically:\n  $ {cmd}")
+
+    action_results: list[str] = []
+    for edit in actions.extract_edits(output):
+        result = actions.apply_edit(project_root, edit)
+        if result.ok:
+            track(edit.path)
+        if result.error:
+            action_results.append(truncate_text(result.error))
+    for bad in actions.extract_malformed_edits(output):
+        action_results.append(truncate_text(actions.format_action_error(
+            action="edit",
+            reason="edit block is not a valid SEARCH/REPLACE pair",
+            path=bad.path,
+            suggestion=(
+                "use exactly:\n<<<<<<< SEARCH\n<the old lines>\n=======\n"
+                "<the new lines>\n>>>>>>> REPLACE"
+            ),
+        )))
+    for cmd in actions.extract_runs(output):
+        result = execution.apply_run(project_root, cmd)
+        if result:
+            action_results.append(truncate_text(result))
+    for url in actions.extract_fetches(output):
+        result = webfetch.apply_fetch(url)
+        if result:
+            action_results.append(truncate_text(result))
+    for query in actions.extract_searches(output):
+        result = websearch.apply_search(query)
+        if result:
+            action_results.append(truncate_text(result))
+    for path, symbol in actions.extract_symbol_requests(output):
+        if not cce.available:
+            ui.warn(f"pedido get_symbol({path}, {symbol}) mas o CCE não está ligado -- a ignorar")
+            continue
+        snippet = cce.get_symbol(path, symbol)
+        action_results.append(
+            truncate_text(snippet) if snippet
+            else f"get_symbol: símbolo `{symbol}` não encontrado em {path}"
+        )
+    return action_results
+
+
+def build_verify_config(cfg: dict) -> verification.VerifyConfig:
+    override = cfg.get("verify_command")
+    if override is not None and not (
+        isinstance(override, list) and override
+        and all(isinstance(part, str) for part in override)
+    ):
+        ui.warn("verify_command must be a list of strings -- ignoring it")
+        override = None
+    return verification.VerifyConfig(
+        enabled=bool(cfg.get("verify_after_change", True)),
+        timeout_s=int(cfg.get("verify_timeout_s", 180)),
+        override_argv=list(override) if override else None,
+    )
+
+
 def run_turn(
     agent: Agent,
     task: str,
@@ -181,11 +302,13 @@ def run_turn(
     num_ctx: int,
     max_total_context_chars: int,
     initial_kv_context: list[int] | None = None,
+    verify: verification.VerifyConfig | None = None,
 ) -> list[int] | None:
     """Streams a response, applies every action block it contains, and --
-    only if a ```run/```fetch/```search/```symbol actually produced output --
-    feeds that back for up to MAX_FOLLOWUP_TURNS more turns. write/delete
-    never trigger a follow-up: their confirmation message is context enough.
+    only if a ```run/```fetch/```search/```symbol produced output, or an
+    ```edit failed in a way the model can fix -- feeds that back for up to
+    MAX_FOLLOWUP_TURNS more turns. Successful write/edit/delete never
+    trigger a follow-up: their confirmation message is context enough.
     Each hop's action results are truncated (context/truncate.py -- CCE has
     no generic text-compression tool, only file/symbol-shaped ones) and the
     accumulated follow-up context is capped against max_total_context_chars,
@@ -206,9 +329,16 @@ def run_turn(
     the no-cache fallback path use.
 
     Returns the final KV context array (or None) so the caller can offer it
-    to the *next* run_turn() call, if it wants to."""
+    to the *next* run_turn() call, if it wants to.
+
+    `verify` enables the post-mutation verification phase; None means "no
+    verification", which is exactly the pre-existing behaviour. Verification
+    runs once, after the exploration loop -- never between hops, because
+    running the suite mid-change tests a half-finished edit and multiplies
+    the cost on hardware where each execution is real wall time."""
     current_task = task
     hop_kv_context = initial_kv_context
+    mutated: list[str] = []
     for hop in range(MAX_FOLLOWUP_TURNS + 1):
         if hop == 0:
             # Start of a new task: current_task IS the new content (there's
@@ -238,67 +368,46 @@ def run_turn(
 
         print_usage_summary(usage, num_ctx)
 
-        for write in actions.extract_writes(output):
-            actions.apply_write(project_root, write)
-        for path in actions.extract_deletes(output):
-            actions.apply_delete(project_root, path)
-        for cmd in actions.extract_shell_suggestions(output):
-            ui.info(f"suggested command -- not run automatically:\n  $ {cmd}")
-
-        action_results: list[str] = []
-        for cmd in actions.extract_runs(output):
-            result = execution.apply_run(project_root, cmd)
-            if result:
-                action_results.append(truncate_text(result))
-        for url in actions.extract_fetches(output):
-            result = webfetch.apply_fetch(url)
-            if result:
-                action_results.append(truncate_text(result))
-        for query in actions.extract_searches(output):
-            result = websearch.apply_search(query)
-            if result:
-                action_results.append(truncate_text(result))
-        for path, symbol in actions.extract_symbol_requests(output):
-            if not cce.available:
-                ui.warn(f"pedido get_symbol({path}, {symbol}) mas o CCE não está ligado -- a ignorar")
-                continue
-            snippet = cce.get_symbol(path, symbol)
-            action_results.append(
-                truncate_text(snippet) if snippet else f"get_symbol: símbolo `{symbol}` não encontrado em {path}"
-            )
-
+        action_results = _apply_blocks(output, project_root, cce, mutated)
         if not action_results:
-            return hop_kv_context
+            break
         if hop >= MAX_FOLLOWUP_TURNS:
             ui.info(f"follow-up limit reached ({MAX_FOLLOWUP_TURNS}) -- stopping here")
-            return hop_kv_context
-
-        appended = (
-            f"\n\n--- RESULT OF YOUR LAST ACTION ---\n"
-            + "\n\n".join(action_results)
-            + "\n--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
+            break
+        current_task, appended, hop_kv_context = _append_result(
+            task, current_task, action_results, max_total_context_chars, num_ctx, hop_kv_context,
         )
-        if len(current_task) + len(appended) > max_total_context_chars:
-            ui.warn(
-                f"contexto acumulado dos follow-ups excede o orçamento seguro em tokens "
-                f"({max_total_context_chars} chars, derivado de num_ctx={num_ctx}) -- "
-                f"a descartar histórico mais antigo, mantendo só o resultado mais recente"
-            )
-            current_task = (
-                f"{task}\n\n--- RESULT OF YOUR LAST ACTION ---\n"
-                f"{truncate_text(action_results[-1], max_chars=max_total_context_chars // 2)}\n"
-                "--- CONTINUE THE TASK ABOVE, USING THAT RESULT ---"
-            )
-            # The cached prefix (hop_kv_context) covers the *dropped* history
-            # too -- once older hops are discarded, "resend just the delta"
-            # no longer means the same thing (the delta would land on top of
-            # a prefix that includes text we just chose to drop from
-            # `current_task`). Fall back to a clean, uncached resend of the
-            # freshly-rebuilt current_task next hop rather than risk sending
-            # a confusing/duplicated prompt.
-            hop_kv_context = None
-        else:
-            current_task += appended
+
+    if verify is None or not mutated:
+        return hop_kv_context
+
+    outcome = verification.verify_project(project_root, mutated, verify)
+    if not outcome.needs_repair:
+        return hop_kv_context
+
+    current_task, delta, hop_kv_context = _append_result(
+        task, current_task, [verification.failure_feedback(outcome)],
+        max_total_context_chars, num_ctx, hop_kv_context,
+    )
+    prompt, ctx = (delta, "") if hop_kv_context is not None else (current_task, context)
+    try:
+        output, usage, hop_kv_context = stream_and_print(
+            agent.run_stream(prompt, ctx, kv_context=hop_kv_context)
+        )
+    except OllamaError as e:
+        ui.error(str(e))
+        return hop_kv_context
+    print_usage_summary(usage, num_ctx)
+
+    repair_mutated: list[str] = []
+    # Every repair block is still applied and still individually confirmed
+    # (a ```run in the repair response executes if the human says yes), but
+    # the returned action results are DISCARDED -- that is what makes the
+    # model-call bound structural rather than arithmetic.
+    _apply_blocks(output, project_root, cce, repair_mutated)
+    if repair_mutated:
+        # Reported to the human by verify_project; never fed back anywhere.
+        verification.verify_project(project_root, repair_mutated, verify)
     return hop_kv_context
 
 
@@ -348,6 +457,8 @@ def main() -> None:
             f"pode descartar silenciosamente o início do prompt."
         )
 
+    verify_cfg = build_verify_config(cfg)
+
     cce = CCEClient(cfg["cce_binary"], project_root)
     if cce.start():
         tools = ", ".join(cce.tool_names) or "nenhuma"
@@ -377,6 +488,9 @@ def main() -> None:
     print(BANNER)
     tree = build_tree(project_root, cfg["max_tree_entries"])
     pinned_files: list[str] = []
+    last_selection: list[ScoredFile] = []
+    last_context_used_chars = 0
+    last_selection_pinned = False
     cce_died_warned = False
     reuse_across_turns = bool(cfg.get("reuse_context_across_turns", True))
     session_kv_context: list[int] | None = None
@@ -392,9 +506,11 @@ def main() -> None:
             cce_died_warned = True
 
     def build_context(paths: list[str], task_description: str) -> str:
+        nonlocal last_context_used_chars
         context, warnings = assemble_file_context(
             cce, project_root, paths, cfg["max_total_context_chars"], task_description
         )
+        last_context_used_chars = len(context)
         for w in warnings:
             ui.warn(w)
         if warnings:
@@ -403,6 +519,17 @@ def main() -> None:
                 "turno -- a resposta pode assentar em conteúdo incompleto"
             )
         return context
+
+    def print_context_report() -> None:
+        print(
+            format_selection(
+                last_selection,
+                budget_chars=cfg["max_total_context_chars"],
+                used_chars=last_context_used_chars,
+                num_ctx=cfg["num_ctx"],
+                pinned=last_selection_pinned,
+            )
+        )
 
     def call_run_turn(agent, task, ctx, initial_kv_context=None):
         """Wraps run_turn with the orphaned-generation check + advisory
@@ -422,7 +549,7 @@ def main() -> None:
         with busy.held():
             return run_turn(
                 agent, task, ctx, project_root, cce, cfg["num_ctx"], cfg["max_total_context_chars"],
-                initial_kv_context=initial_kv_context,
+                initial_kv_context=initial_kv_context, verify=verify_cfg,
             )
 
     try:
@@ -433,9 +560,27 @@ def main() -> None:
                 break
             if not line:
                 continue
+            if line.lower() in ("y", "n", "yes", "no"):
+                # A spare confirmation line in a piped script would otherwise
+                # be sent to the model as a full multi-minute phantom turn.
+                ui.info("nada a confirmar agora -- linha ignorada")
+                continue
 
             if line in ("/quit", "/exit"):
                 break
+            if line in ("/help", "/?"):
+                print(BANNER)
+                continue
+            if line in ("/context", "/why"):
+                print_context_report()
+                continue
+            if line == "/verify":
+                # A REPL command, not a turn: discovery happens inside
+                # verify_project and this path never calls the model.
+                outcome = verification.verify_project(project_root, [], verify_cfg)
+                if not outcome.ran:
+                    ui.warn(outcome.skip_reason)
+                continue
             if line == "/tree":
                 tree = build_tree(project_root, cfg["max_tree_entries"])
                 session_kv_context = None  # tree text is part of what's cached; it just changed
@@ -452,6 +597,8 @@ def main() -> None:
             if line.startswith("/files "):
                 pinned_files = line.removeprefix("/files ").split()
                 session_kv_context = None  # pinned files change what's cached too
+                last_selection = [ScoredFile(p, 1.0) for p in pinned_files]
+                last_selection_pinned = bool(pinned_files)
                 ui.info(f"pinned: {', '.join(pinned_files) or '(none)'}")
                 continue
             if line.startswith("/model "):
@@ -476,6 +623,8 @@ def main() -> None:
                     ui.warn(f"unknown agent '{agent_name}'. try: {', '.join(sub_agents.names())}")
                     continue
                 check_cce_alive()
+                last_selection = [ScoredFile(p, 1.0) for p in pinned_files]
+                last_selection_pinned = bool(pinned_files)
                 context = build_context(pinned_files, task)
                 # A sub-agent has its own system prompt, so it can't share the
                 # main coder's cached kv_context -- and running it invalidates
@@ -487,7 +636,16 @@ def main() -> None:
 
             # Default: main coder turn.
             check_cce_alive()
-            files_for_context = pinned_files or list_source_files(project_root)[:5]
+            if pinned_files:
+                last_selection = [ScoredFile(p, 1.0) for p in pinned_files]
+                last_selection_pinned = True
+                files_for_context = pinned_files
+            else:
+                last_selection = select_files_for_task(project_root, line, limit=5)
+                last_selection_pinned = False
+                files_for_context = [item.path for item in last_selection]
+            if files_for_context:
+                ui.info("contexto: " + ", ".join(files_for_context))
             file_context = build_context(files_for_context, line)
             prompt = build_user_prompt(line, tree, file_context)
             kv_in = session_kv_context if reuse_across_turns else None

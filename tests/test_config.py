@@ -100,5 +100,22 @@ class TestDeriveMaxContextChars(unittest.TestCase):
             self.assertEqual(cfg["max_total_context_chars"], 99999)
 
 
+class TestVerificationDefaults(unittest.TestCase):
+    def test_new_keys_exist_with_the_designed_defaults(self):
+        self.assertIs(config.DEFAULTS["verify_after_change"], True)
+        self.assertEqual(config.DEFAULTS["verify_timeout_s"], 180)
+        self.assertIsNone(config.DEFAULTS["verify_command"])
+
+    def test_an_existing_config_without_them_still_loads_them(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "config.json")
+            path.write_text(json.dumps({"model": "qwen2.5-coder:7b"}))
+            with mock.patch.object(config, "CONFIG_FILE", path):
+                cfg = config.load_config()
+        self.assertIs(cfg["verify_after_change"], True)
+        self.assertEqual(cfg["verify_timeout_s"], 180)
+        self.assertIsNone(cfg["verify_command"])
+
+
 if __name__ == "__main__":
     unittest.main()

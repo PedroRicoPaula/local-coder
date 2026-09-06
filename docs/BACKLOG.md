@@ -20,6 +20,45 @@ trigger condition actually happens.
 
 ## Done
 
+- **Slice B: deterministic verification -> repair** (`verification.py`,
+  `execution.py`, `config.py`, `main.py`). After a mutation, localcoder runs
+  the project's own check command -- discovered with filesystem checks only
+  (pytest / unittest / npm / cargo / go / `compileall` fallback), re-sorted
+  by the language of what actually changed -- as `argv` with `shell=False`,
+  behind its own y/N per execution. Passing costs zero extra model calls;
+  failing or timing out costs exactly one repair call followed by at most one
+  final verification that can never recurse. `execution.py` gained a
+  structured `CommandResult`/`Status` and a process-group kill on timeout;
+  `/verify` uses discovery instead of a hardcoded `compileall`; a stray `y`
+  at the REPL is a logged no-op instead of a phantom turn. See
+  `docs/superpowers/specs/2026-09-04-safe-verification-repair-design.md`.
+
+- **Slice A: blocking safety foundation** (`pathpolicy.py`, `textfile.py`,
+  `actions.py`, `gitsafety.py`, `ui.py`). One path gate for every mutation
+  (no `.git/**`, no credential/key files, `.gitignore`/`.github/` still
+  writable); byte-faithful writes (CRLF and BOM preserved, non-UTF-8
+  refused rather than mangled, diff shown before every overwrite, identical
+  content skipped); `git add`/`commit` path-scoped so a user's unrelated
+  staged work is never swept into a `localcoder:` commit; `/undo` rebuilt on
+  `git revert` -- non-destructive, root-commit-capable, conflict-aborting,
+  SHA-based "already reverted" detection; EOF at a confirmation is "no";
+  `OSError` never escapes an action; a malformed `edit` fence now gets the
+  same structured `ERROR:` feedback a failed edit gets instead of being
+  dropped silently. See
+  `docs/superpowers/specs/2026-09-04-safe-verification-repair-design.md`.
+
+- **`edit` action + ranked context + `/context`** (`actions.py`,
+  `context/relevance.py`, `main.py`). Default file selection is no longer
+  "the 5 shallowest source paths" -- files are scored from the task
+  (path/stem overlap + a capped content scan). ` ```edit:path ` applies a
+  unique SEARCH/REPLACE snippet, shows a unified diff, refuses 0/2+
+  matches and empty search (`str.count("")` is not 0), and failed edits
+  feed a labeled ERROR block into the existing follow-up hop loop so
+  qwen2.5-coder:7b can retry without a full-file rewrite. `/context` and
+  `/why` reprint the last selection and char budget. Fast tests cover parser,
+  ranking, and the failed-edit hop; `tests.test_live` gained a decoy-tree
+  case that does **not** use `/files`.
+
 - **Ollama `context`-array reuse, within-turn and cross-turn**
   (`llm/ollama_client.py`, `agents/base.py`, `main.py`). Root cause
   confirmed via ollama/ollama#14780: the CPU backend never reuses KV cache

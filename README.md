@@ -38,31 +38,31 @@ localcoder
 ## What it does each turn
 
 1. Builds a compact tree of the current directory (`.gitignore`-aware).
-2. Compresses whichever files are in context through CCE (heuristic,
+2. Ranks source files against the task (path + keyword overlap; `/files`
+   still pins an explicit set) and compresses those through CCE (heuristic,
    near-instant, no LLM involved in this step) — falls back to raw file
    reads if the CCE binary isn't built yet. Any file that gets truncated or
    skipped to fit the context budget prints a visible warning (not just an
    inline marker only the model would see) -- see "Token usage & context
-   budget" below.
+   budget" below. `/context` (alias `/why`) reprints the last selection
+   and char budget.
 3. Injects any `.md` rule files from `skills/` into the system prompt.
 4. Streams the response from Ollama live, token by token, instead of
    sitting on a silent wait. A spinner covers the gap before the first
    token too -- connection + prompt prefill, the part that used to be pure
    silence -- and each response ends with a colored token-usage bar (see
    "Streaming" and "Token usage & context budget" below).
-5. Parses the complete reply for action blocks (write, delete, run, fetch,
+5. Parses the complete reply for action blocks (write, edit, delete, run, fetch,
    search, symbol, or a display-only shell suggestion) and applies each
    one, individually confirmed -- see "Actions" below.
-6. If a `run`, `fetch`, `search`, or `symbol` produced output, feeds it back
-   for up to two more automatic turns so the model can act on what it
-   learned (install a dependency, then use it; read a page, then write
-   against it; look up a search result, then use it; ask for an elided
-   function body, then read it) -- bounded, not an open-ended agent loop,
-   because each hop costs real CPU-minutes. Each hop's output is truncated
-   heuristically (CCE has no generic text-compression tool, only
-   file/symbol-shaped ones) and the accumulated follow-up context is capped
-   against the same budget, dropping older hop results before newer ones
-   rather than growing unboundedly.
+6. If a `run`, `fetch`, `search`, or `symbol` produced output, **or an
+   `edit` failed** (0 matches, ambiguous snippet, missing file), feeds that
+   back for up to two more automatic turns so the model can act on what it
+   learned. Successful write/edit/delete do not start a hop. Each hop's
+   output is truncated heuristically (CCE has no generic text-compression
+   tool, only file/symbol-shaped ones) and the accumulated follow-up
+   context is capped against the same budget, dropping older hop results
+   before newer ones rather than growing unboundedly.
 
 ## Streaming
 
@@ -155,12 +155,13 @@ exceeds the derived safe cap.
 
 ## Actions
 
-Seven fenced-block kinds, all sharing the same variable-length-fence
+Eight fenced-block kinds, all sharing the same variable-length-fence
 convention (`actions.py`):
 
 | Block | Effect | Confirmed? | Fed back to the model? |
 |---|---|---|---|
-| ` ```write:path ` | create/replace a file | yes, y/N | no |
+| ` ```write:path ` | create/replace a file; preserves the existing file's CRLF/LF and UTF-8 BOM, refuses a non-UTF-8 target, shows a unified diff (capped at 200 lines) before overwriting, and skips silently when the content is already identical | yes, y/N | no |
+| ` ```edit:path ` | replace one unique snippet (`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`); matches LF snippets against LF or CRLF text, preserves all bytes outside the splice plus any UTF-8 BOM, refuses non-UTF-8 files and 0 or 2+ total matches, and shows a capped unified diff before y/N | yes, y/N | **on failure *and* on a malformed fence** (structured ERROR block, up to 2 hops) |
 | ` ```delete:path ` | remove a file | yes, y/N | no |
 | ` ```run ` | execute a shell command | yes, y/N, plus a denylist that refuses catastrophic patterns without even prompting | yes, up to 2 hops |
 | ` ```fetch:url ` | fetch a web page as text | yes, y/N, http(s) only, skipped immediately if offline | yes, up to 2 hops |
@@ -178,6 +179,16 @@ device, `sudo`) is mitigation, not a promise, same spirit as
 explicit y/N, which is the real gate, matching OWASP's AI Agent Security
 Cheat Sheet guidance for agentic CLIs: never blanket-grant execution,
 always require approval for anything with real-world effect.
+
+`write`, `edit` and `delete` all resolve their target through one gate
+(`pathpolicy.py`) before anything else happens: nothing outside the project
+root, nothing inside `.git/` (component match, so `.gitignore`,
+`.gitattributes`, `.gitmodules` and `.github/` stay writable), nothing that
+`context/denylist.py` recognises as a credential or key file, and no
+directories. A refused `write`/`delete` is display-only; a refused `edit`
+also gets a structured `ERROR:` block so the model can retry with a
+different path. The escape hatch for a genuinely needed `.env` is to create
+it by hand, outside localcoder.
 
 ## Web search
 
@@ -210,14 +221,76 @@ it's offline.
 
 ## Git safety net
 
-If the current directory is a git repo, every confirmed `write`/`delete` is
-auto-committed with a `localcoder: ` prefixed message (`gitsafety.py`).
-`/undo` reverts the last commit -- but only if its message has that prefix,
-so it can never discard a commit that was actually your own work, and it
-refuses (rather than doing something more elaborate) if that commit happens
-to be the repository's very first. Outside a git repo, the y/N prompt at
-write/delete time is the only safety net there is -- `git init` first if you
-want `/undo` available.
+If the current directory is a git repo, every confirmed `write`/`edit`/`delete`
+is auto-committed with a `localcoder: ` prefixed message (`gitsafety.py`),
+staging **only** the file that action touched -- your own unrelated staged or
+modified work is never swept into a `localcoder:` commit.
+
+`/undo` reverts the newest `localcoder: ` commit with `git revert`, never
+`git reset --hard`. That means:
+
+- it can never discard uncommitted work -- if a file the target commit
+  touched is dirty, `/undo` refuses and tells you to commit or stash first;
+- it never rewrites history -- the revert is a *new* commit, so the reverted
+  commit stays in the log (accepted trade-off);
+- it works on the repository's very first commit, which the old
+  `reset --hard` implementation had to refuse;
+- pressing `/undo` repeatedly walks backwards through localcoder's own
+  commits instead of flip-flopping one, because a commit already named in a
+  later commit's `This reverts commit <sha>.` body is skipped;
+- a conflicting revert is rolled back with `git revert --abort` and leaves no
+  revert in progress;
+- a commit you made yourself is never a candidate.
+
+Outside a git repo, the y/N prompt at write/delete time is the only safety
+net there is -- `git init` first if you want `/undo` available.
+
+## Verification and repair
+
+After a turn actually changed a file, localcoder runs the project's own
+check command and, if it fails, gives the model exactly one attempt to fix
+it. Nothing here involves an extra model call to *decide* anything --
+discovery is plain filesystem checks (`verification.py`).
+
+Discovery order (first match wins, and any candidate whose executable is
+missing from `PATH` is dropped):
+
+| Detected by | Command |
+|---|---|
+| `pytest.ini`, `[tool.pytest` in `pyproject.toml`, or `[tool:pytest]` in `setup.cfg` | `python -m pytest -q -x` |
+| `tests/test_*.py` | `python -m unittest discover -q -s tests -t .` |
+| top-level `test_*.py` | `python -m unittest discover -q` |
+| `package.json` with a real `scripts.test` | `npm test --silent` |
+| `Cargo.toml` | `cargo test --quiet` |
+| `go.mod` | `go test ./...` |
+| any `*.py` | `python -m compileall -q .` |
+| nothing above | nothing runs; localcoder says so and moves on |
+
+Before that order is applied, candidates are re-sorted by what the turn
+actually changed, so editing `src/lib.rs` in a polyglot repo picks `cargo`
+and editing a README picks nothing new.
+
+The rules that bound the cost:
+
+- **Every single verification execution needs its own y/N**, showing the
+  exact command. There is no once-per-session approval.
+- Commands run as `argv` with `shell=False`; no model output ever becomes an
+  argv element. A timeout (default 180s) kills the whole process group.
+- **Passing verification costs zero extra model calls.** Exit code 5 from
+  `unittest`/`pytest` means "no tests", not failure. A missing toolchain is
+  reported, never treated as a bug to repair.
+- A failure or timeout produces **exactly one** repair call, then at most one
+  final verification whose result is shown to you and never fed back to the
+  model. The absolute bound per turn is 4 model calls and 2 verification
+  executions.
+- `/verify` runs the same discovery on demand and makes **no** model call at
+  all.
+
+Config keys (`config.json`): `verify_after_change` (default `true` -- set it
+to `false` on slow hardware), `verify_timeout_s` (default `180`), and
+`verify_command` (default `null`; a list of strings like
+`["make", "check"]` overrides discovery entirely). The repair bound itself
+is deliberately not configurable.
 
 ## Repo layout
 
@@ -228,6 +301,7 @@ config.py, config.json    model, host, timeouts, budgets (max_total_context_char
                           derived from num_ctx unless set explicitly)
 context/
   tree.py                project tree walker
+  relevance.py             keyword ranking for which files enter the prompt
   cce_client.py            MCP client wrapping the CCE binary
   denylist.py               credential/key files, never sent as context
   truncate.py                heuristic head+tail truncation for text CCE can't compress
@@ -248,7 +322,7 @@ mcp/
   client.py                  generic stdio MCP client (JSON-RPC), reusable
                               for any future MCP server, not just CCE
 mcp.servers.json               MCP server list (context-compressor pre-wired)
-actions.py                      parses all seven action blocks, applies write/delete
+actions.py                      parses all eight action blocks, applies write/edit/delete
 execution.py                     runs ```run blocks (denylist + confirm + capture)
 webfetch.py                      fetches ```fetch blocks (confirm + HTML-to-text)
 websearch.py                      DuckDuckGo HTML scrape for ```search blocks + /search
@@ -375,20 +449,31 @@ has no thinking-mode branch at all, so this doesn't affect the default.
 
 ## Security
 
+- EOF on stdin is treated as "no" at every confirmation prompt
+  (`ui.confirm`), so a piped or non-interactive run can never auto-approve
+  and can never die with a traceback halfway through a turn.
+- **Model-emitted mutations can never touch git internals or credential
+  files:** `pathpolicy.resolve_for_mutation()` is the single gate all three
+  mutating actions call, so there is no second code path to keep in sync.
 - **Credential files never enter the model's context.** `context/denylist.py`
   (ported from CCE's own `denylist.rs`, prefix-family matching so `.env.local`
   and `id_ecdsa` are caught, not just `.env` and `id_rsa`) is checked both for
   auto-selected files and anything passed to `/files` explicitly — a denied
   path is refused with a visible message, not silently dropped.
-- **Every file write requires a y/N confirmation** (`actions.py`); nothing is
-  written without it, and a write path is checked against the project root
+- **Every file write or edit requires a y/N confirmation** (`actions.py`); nothing is
+  written without it, and a write/edit path is checked against the project root
   before that prompt even appears (no `../../etc/passwd` via a crafted
-  `write:` block).
-- **Shell commands are never executed**, only ever printed as a suggestion —
-  matching the standard guidance for agentic CLIs (OWASP's AI Agent Security
-  Cheat Sheet: allowlist tools, never grant blanket shell access, require
-  approval for high-impact actions). There is no code path in this project
-  that runs a shell command the model proposed.
+  `write:`/`edit:` block). `edit` also refuses a SEARCH snippet that matches
+  0 or 2+ times, so it cannot silently rewrite the wrong occurrence.
+- **Model-proposed ` ```run ` commands execute only after an explicit y/N**,
+  and a denylist refuses catastrophic patterns (`rm -rf`, `mkfs`, `dd`,
+  fork bomb, `shutdown`/`reboot`, raw devices, `sudo`) without prompting.
+  ` ```shell ` is the suggestion-only block and never runs. Verification
+  commands are discovered from the project (or taken from `verify_command`
+  in config) and run as argv with `shell=False` -- no model string ever
+  becomes an argv element. This matches OWASP's AI Agent Security Cheat
+  Sheet: allowlist tools, never grant blanket shell access, require
+  approval for high-impact actions.
 - **`security.py` scans generated file content for secret-shaped strings**
   (AWS keys, PEM headers, `sk-`/`ghp_`-style tokens, `key = "..."` patterns)
   before the write confirmation prompt, and flags a match inline. This is a
@@ -409,7 +494,7 @@ python3 -m unittest discover tests
 
 Pure-logic tests (denylist, secret-pattern scan, action-block parsing
 including the nested-fence case, tree sorting/filtering, config merging,
-the command denylist, git commit/undo) run in well under a second, no
+the command denylist, git commit/undo, edit uniqueness, keyword ranking) run in well under a second, no
 Ollama or network needed. The one true end-to-end test is opt-in and slow
 for the same reason everything on this hardware is slow:
 
@@ -417,10 +502,11 @@ for the same reason everything on this hardware is slow:
 LOCALCODER_LIVE_TESTS=1 python3 -m unittest tests.test_live
 ```
 
-It spawns `main.py` for real against a real running Ollama, feeds it an
-actual bug (`ZeroDivisionError` → should become a clear `ValueError`), and
-checks the *behavior* of the resulting code (imports it and calls the
-function) rather than grepping the source text for a particular phrasing.
+It spawns `main.py` for real against a real running Ollama. Two cases:
+a pinned one-file project, and a decoy-filled tree where the relevant
+module is *not* among the shallowest paths (so ranking has to work). Both
+check the *behavior* of the resulting code (import and call) rather than
+grepping the source text for a particular phrasing.
 
 ## Deferred: multi-context / subagent chunking
 
@@ -499,8 +585,8 @@ see `docs/LESSONS_LEARNED.md` for the full investigation):
   change that fixes a 2017 dual-core CPU.
 - **No conversation memory across turns, still.** Each turn is a fresh
   `generate()` call with fresh context assembly — "no, the other file"
-  won't work; be explicit each time, or use `/files` to pin what's
-  relevant. What *did* change: turns within the same session now reuse
+  won't work as conversation memory; ranking now picks files from the task
+  keywords, and `/files` still pins an explicit set. What *did* change: turns within the same session now reuse
   Ollama's `context` token array from the previous turn purely to skip
   re-prefilling the (identical) system prompt from zero -- see "Context
   reuse" below. That's a prefill-speed optimization, not memory: the model

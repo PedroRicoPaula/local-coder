@@ -34,7 +34,7 @@ class TestLiveEndToEnd(unittest.TestCase):
             )
             result = subprocess.run(
                 [sys.executable, str(ROOT / "main.py")],
-                cwd=project, input=script, capture_output=True, text=True, timeout=600,
+                cwd=project, input=script, capture_output=True, text=True, timeout=900,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -46,6 +46,92 @@ class TestLiveEndToEnd(unittest.TestCase):
             self.assertEqual(fixed_calc.divide(4, 2), 2)
             with self.assertRaises(ValueError):
                 fixed_calc.divide(1, 0)
+
+    def test_ranks_relevant_file_without_files_pin(self):
+        """Without /files, context used to be the 5 shallowest paths. A
+        decoy-filled tree must still get the auth module into context so
+        the model can fix it."""
+        with tempfile.TemporaryDirectory() as project:
+            for name in ("aaa.py", "bbb.py", "ccc.py", "ddd.py", "eee.py"):
+                Path(project, name).write_text("# decoy\n")
+            pkg = Path(project, "pkg")
+            pkg.mkdir()
+            (pkg / "auth.py").write_text("def divide(a, b):\n    return a / b\n")
+
+            script = (
+                "Fix the authentication divide function so it raises a clear "
+                "ValueError instead of a ZeroDivisionError when b is 0.\n"
+                "y\n"
+                "/quit\n"
+            )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "main.py")],
+                cwd=project, input=script, capture_output=True, text=True, timeout=900,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            sys.path.insert(0, str(pkg))
+            import auth as fixed_auth  # noqa: E402
+
+            self.assertEqual(fixed_auth.divide(4, 2), 2)
+            with self.assertRaises(ValueError):
+                fixed_auth.divide(1, 0)
+
+    def test_verification_repairs_a_failing_test(self):
+        """Real model, real Ollama, real verification: localcoder must write
+        a fix, run the discovered unittest command behind a y/N, and -- if
+        the first attempt fails -- repair exactly once, never twice."""
+        with tempfile.TemporaryDirectory() as project:
+            Path(project, "calc.py").write_text("def divide(a, b):\n    return a / b\n")
+            Path(project, "tests").mkdir()
+            Path(project, "tests", "test_calc.py").write_text(
+                "import unittest\n"
+                "\n"
+                "from calc import divide\n"
+                "\n"
+                "\n"
+                "class TestDivide(unittest.TestCase):\n"
+                "    def test_by_zero_raises_value_error(self):\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            divide(1, 0)\n"
+                "\n"
+                "    def test_ordinary_division(self):\n"
+                "        self.assertEqual(divide(4, 2), 2)\n"
+            )
+
+            script = (
+                "/files calc.py tests/test_calc.py\n"
+                "Make tests/test_calc.py pass by fixing calc.py.\n"
+                "y\n"   # apply the write/edit
+                "y\n"   # run verification
+                "y\n"   # possible repair edit
+                "y\n"   # final verification
+                "/quit\n"
+            )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "main.py")],
+                cwd=project, input=script, capture_output=True, text=True, timeout=900,
+            )
+            combined = result.stdout + result.stderr
+
+            # 1. Surplus `y` lines are now no-ops and a missing one declines
+            #    cleanly, so this also regression-tests the old EOF crash.
+            self.assertEqual(result.returncode, 0, combined)
+
+            # 2. Real behaviour, not a grep of the source: the resulting code
+            #    must actually pass its own suite.
+            verify = subprocess.run(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+                cwd=project, capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+
+            # 3. Verification really ran, using the discovered command.
+            self.assertIn("run verification", combined)
+            self.assertIn("unittest discover", combined)
+
+            # 4. The single-repair bound holds against a real model.
+            self.assertLessEqual(combined.count("VERIFICATION FAILED"), 1)
 
 
 if __name__ == "__main__":

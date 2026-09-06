@@ -138,3 +138,82 @@ check the full response shape first. The heuristic (`config.py`'s
 `CHARS_PER_TOKEN`) is still needed for *pre-flight* budgeting (before a
 call is made), but post-call accounting should always prefer the real
 number when the API provides one.
+
+## `str.count("")` is not zero
+
+**Symptom risk**: an `edit` whose SEARCH block is empty looks like "match
+nothing" but `original.count("")` returns `len(original) + 1`, so the
+uniqueness check (`== 1`) can fail for the wrong reason -- or, on a
+one-character file, pass and then `replace("", new, 1)` inserts at the
+start.
+
+**Takeaway**: reject empty search *before* counting matches. The uniqueness
+gate only means something for a non-empty needle.
+
+## Text-mode reads cannot support byte-faithful edits
+
+**Symptom risk**: `Path.read_text()` uses universal-newline translation, so
+CRLF becomes LF before matching. Writing the edited string back then changes
+every line ending in the file even when the requested splice touched one line.
+Using `errors="replace"` also turns invalid bytes into replacement characters,
+and an unpaired surrogate can fail while rendering the diff or truncate a file
+if encoding happens after opening it for writing.
+
+**Takeaway**: mutation paths must decode strict UTF-8 without newline
+translation, splice the exact decoded text, preserve the BOM separately, and
+encode the complete result before showing a diff, prompting, or touching the
+target. EOL-tolerant matching should aggregate exact LF and rendered CRLF
+candidate counts without normalizing the whole file.
+
+## `git revert`'s failure modes are three different things, and only one of them is abortable
+
+Measured directly (git 2.55.0, 2026-09-04) while designing the non-destructive
+`/undo`:
+
+| Situation | Exit | State left behind |
+|---|---|---|
+| Clean revert, including of a **root** commit | 0 | new revert commit |
+| Unrelated dirty/untracked file present | 0 | new revert commit |
+| Dirty or staged change on a path the commit touched | **128** | nothing modified, **no revert in progress** -- `git revert --abort` also fails with 128 |
+| Content conflict | **1** | `UU` in status, `.git/REVERT_HEAD` present, `git revert --abort` exits 0 and fully restores |
+
+**Takeaway**: never call `git revert --abort` unconditionally after a
+non-zero exit -- check `git rev-parse --git-path REVERT_HEAD` on disk first,
+because the exit-128 path has nothing to abort and turns a clean refusal
+into a confusing double failure. Also: `git diff-tree` needs `--root` or a
+root commit reports zero changed paths, and reverting a root commit works
+fine, so the old "can't auto-undo the repo's very first commit" refusal was
+an artifact of `reset --hard`, not a git limitation.
+
+## Process-group termination and pipe cleanup are separate timeout problems
+
+**Symptom risk**: killing only a timed-out command's direct process leaves
+grandchildren running. Even after signaling the whole group, an unbounded
+second `communicate()` can still hang if a descendant called `setsid()` and
+kept inherited stdout/stderr open. A `KeyboardInterrupt` during
+`communicate()` can take a third path, skipping ordinary timeout cleanup and
+leaving both the private group and local pipe handles behind.
+
+**Takeaway**: start each command in a private session and signal the known
+group ID derived at launch, never a newly looked-up group after a race.
+Escalate from `SIGTERM` to `SIGKILL` for grandchildren that ignore the first
+signal. Treat pipe draining as a distinct, bounded best-effort step: preserve
+`TimeoutExpired`'s cumulative partial output, but close local pipe handles and
+reap within fixed cleanup deadlines instead of waiting forever for EOF from an
+escaped pipe holder. On `BaseException`, perform the same group kill,
+close, and bounded reap before re-raising so the CLI's existing Ctrl-C handler
+still owns user-facing behavior.
+
+## Exit code 5 from `unittest`/`pytest` means "no tests", not "failure"
+
+**Symptom risk**: `python3 -m unittest discover -q` in a directory with no
+test cases exits **5** ("NO TESTS RAN"), and pytest uses the same code for
+"no tests collected". Treating any non-zero exit as a failure would fire a
+pointless repair call -- an extra multi-minute model call on CPU-only
+hardware -- every time localcoder touched a project that has no tests yet.
+
+**Takeaway**: exit-code semantics are per-tool, so the reclassification
+belongs in the layer that knows which tool ran (`verification.py`), not in
+the generic runner (`execution.py`). Only `unittest` and `pytest` get the
+special case; a `LAUNCH_ERROR` (missing toolchain) is likewise reported but
+never treated as a code defect the model can fix.

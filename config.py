@@ -93,6 +93,17 @@ DEFAULTS = {
     # num_ctx by load_config() below unless the user sets it explicitly in
     # config.json (see derive_max_context_chars).
 
+    # Verification (see verification.py). Defaults are on with a
+    # conservative timeout: an existing config.json with none of these keys
+    # behaves exactly as designed. `verify_after_change: false` is the kill
+    # switch for slower hardware. The number of repair hops is deliberately
+    # NOT configurable -- MAX_REPAIR_HOPS lives in main.py, because the one
+    # bound preventing an unbounded fix/verify loop should not sit in a file
+    # a user edits casually.
+    "verify_after_change": True,   # run the discovered check after a mutation
+    "verify_timeout_s": 180,       # per verification execution
+    "verify_command": None,        # list[str] argv override; skips discovery
+
     # Skills
     "skills_dir": str(ROOT / "skills"),
 
