@@ -221,14 +221,29 @@ it's offline.
 
 ## Git safety net
 
-If the current directory is a git repo, every confirmed `write`/`edit`/`delete` is
-auto-committed with a `localcoder: ` prefixed message (`gitsafety.py`).
-`/undo` reverts the last commit -- but only if its message has that prefix,
-so it can never discard a commit that was actually your own work, and it
-refuses (rather than doing something more elaborate) if that commit happens
-to be the repository's very first. Outside a git repo, the y/N prompt at
-write/delete time is the only safety net there is -- `git init` first if you
-want `/undo` available.
+If the current directory is a git repo, every confirmed `write`/`edit`/`delete`
+is auto-committed with a `localcoder: ` prefixed message (`gitsafety.py`),
+staging **only** the file that action touched -- your own unrelated staged or
+modified work is never swept into a `localcoder:` commit.
+
+`/undo` reverts the newest `localcoder: ` commit with `git revert`, never
+`git reset --hard`. That means:
+
+- it can never discard uncommitted work -- if a file the target commit
+  touched is dirty, `/undo` refuses and tells you to commit or stash first;
+- it never rewrites history -- the revert is a *new* commit, so the reverted
+  commit stays in the log (accepted trade-off);
+- it works on the repository's very first commit, which the old
+  `reset --hard` implementation had to refuse;
+- pressing `/undo` repeatedly walks backwards through localcoder's own
+  commits instead of flip-flopping one, because a commit already named in a
+  later commit's `This reverts commit <sha>.` body is skipped;
+- a conflicting revert is rolled back with `git revert --abort` and leaves no
+  revert in progress;
+- a commit you made yourself is never a candidate.
+
+Outside a git repo, the y/N prompt at write/delete time is the only safety
+net there is -- `git init` first if you want `/undo` available.
 
 ## Repo layout
 

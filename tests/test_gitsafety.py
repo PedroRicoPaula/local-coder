@@ -12,6 +12,11 @@ def _init_repo(root: str) -> None:
     subprocess.run(["git", "config", "user.name", "localcoder-test"], cwd=root, check=True)
 
 
+def _count_commits(root: str) -> int:
+    return int(subprocess.run(["git", "rev-list", "--count", "HEAD"],
+                              cwd=root, capture_output=True, text=True, check=True).stdout)
+
+
 class TestIsGitRepo(unittest.TestCase):
     def test_non_repo_is_false(self):
         with tempfile.TemporaryDirectory() as root:
@@ -23,7 +28,7 @@ class TestIsGitRepo(unittest.TestCase):
             self.assertTrue(gitsafety.is_git_repo(root))
 
 
-class TestCommitAndUndo(unittest.TestCase):
+class TestCommitChange(unittest.TestCase):
     def test_commit_change_never_raises_outside_repo(self):
         with tempfile.TemporaryDirectory() as root:
             gitsafety.commit_change(root, "should be a silent no-op", ["a.py"])  # must not raise
@@ -68,47 +73,115 @@ class TestCommitAndUndo(unittest.TestCase):
                                    cwd=root, capture_output=True, text=True, check=True).stdout
             self.assertEqual(before, after)
 
-    def test_commit_then_undo_roundtrip(self):
+
+class TestUndoLast(unittest.TestCase):
+    def test_undo_adds_a_revert_commit_and_restores_content(self):
         with tempfile.TemporaryDirectory() as root:
             _init_repo(root)
-            # A prior human commit, same as any real project localcoder gets
-            # pointed at -- the localcoder commit being undone is not the
-            # repo's first, which is the realistic case (see the dedicated
-            # first-commit test below for the edge case where it is).
             Path(root, "README.md").write_text("preexisting\n")
-            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(["git", "add", "README.md"], cwd=root, check=True)
             subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
 
-            target = Path(root) / "a.py"
-            target.write_text("x = 1\n")
+            Path(root, "a.py").write_text("x = 1\n")
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
+            before = _count_commits(root)
+
+            ok, message = gitsafety.undo_last(root)
+            self.assertTrue(ok, message)
+            self.assertEqual(_count_commits(root), before + 1)
+            self.assertFalse(Path(root, "a.py").exists())
+            self.assertTrue(Path(root, "README.md").exists())
+
+    def test_undo_works_on_the_repos_root_commit(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("x = 1\n")
             gitsafety.commit_change(root, "write a.py", ["a.py"])
 
             ok, message = gitsafety.undo_last(root)
             self.assertTrue(ok, message)
-            self.assertFalse(target.exists())
-            self.assertTrue(Path(root, "README.md").exists())  # prior history untouched
+            self.assertFalse(Path(root, "a.py").exists())
 
-    def test_undo_refuses_the_repos_very_first_commit(self):
-        with tempfile.TemporaryDirectory() as root:
-            _init_repo(root)
-            target = Path(root) / "a.py"
-            target.write_text("x = 1\n")
-            gitsafety.commit_change(root, "write a.py", ["a.py"])  # this is the ONLY commit
-
-            ok, message = gitsafety.undo_last(root)
-            self.assertFalse(ok)
-            self.assertTrue(target.exists())  # refused, nothing touched
-
-    def test_undo_refuses_a_commit_it_did_not_make(self):
+    def test_undo_refuses_when_an_affected_path_is_dirty(self):
         with tempfile.TemporaryDirectory() as root:
             _init_repo(root)
             Path(root, "a.py").write_text("x = 1\n")
-            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
-            subprocess.run(["git", "commit", "-q", "-m", "a human's own commit"], cwd=root, check=True)
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
+            Path(root, "a.py").write_text("x = 999  # my own edit\n")
+
+            ok, message = gitsafety.undo_last(root)
+            self.assertFalse(ok)
+            self.assertIn("would be overwritten", message)
+            self.assertIn("a.py", message)
+            self.assertEqual(Path(root, "a.py").read_text(), "x = 999  # my own edit\n")
+
+    def test_a_conflicting_revert_is_rolled_back_completely(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("line1\nline2\nline3\n")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+
+            Path(root, "a.py").write_text("line1\nLOCALCODER\nline3\n")
+            gitsafety.commit_change(root, "edit a.py", ["a.py"])
+
+            Path(root, "a.py").write_text("line1\nHUMAN AGAIN\nline3\n")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "my own change"], cwd=root, check=True)
+
+            before = _count_commits(root)
+            ok, message = gitsafety.undo_last(root)
+            self.assertFalse(ok)
+            self.assertIn("conflicted and was rolled back", message)
+            self.assertEqual(_count_commits(root), before)
+
+            marker = subprocess.run(["git", "rev-parse", "--git-path", "REVERT_HEAD"],
+                                    cwd=root, capture_output=True, text=True, check=True)
+            self.assertFalse(Path(root, marker.stdout.strip()).exists())
+            status = subprocess.run(["git", "status", "--porcelain"],
+                                    cwd=root, capture_output=True, text=True, check=True)
+            self.assertNotIn("UU", status.stdout)
+            self.assertEqual(Path(root, "a.py").read_text(), "line1\nHUMAN AGAIN\nline3\n")
+
+    def test_undo_refuses_a_human_commit(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("x = 1\n")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "a human's own commit"],
+                           cwd=root, check=True)
 
             ok, message = gitsafety.undo_last(root)
             self.assertFalse(ok)
             self.assertTrue(Path(root, "a.py").exists())
+
+    def test_two_undos_revert_two_different_localcoder_commits(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("a\n")
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
+            Path(root, "b.py").write_text("b\n")
+            gitsafety.commit_change(root, "write b.py", ["b.py"])
+
+            ok1, msg1 = gitsafety.undo_last(root)
+            ok2, msg2 = gitsafety.undo_last(root)
+            self.assertTrue(ok1, msg1)
+            self.assertTrue(ok2, msg2)
+            self.assertFalse(Path(root, "a.py").exists())
+            self.assertFalse(Path(root, "b.py").exists())
+            self.assertIn("write b.py", msg1)
+            self.assertIn("write a.py", msg2)
+
+    def test_undo_reports_nothing_left_when_all_localcoder_commits_are_reverted(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("a\n")
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
+            self.assertTrue(gitsafety.undo_last(root)[0])
+
+            ok, message = gitsafety.undo_last(root)
+            self.assertFalse(ok)
+            self.assertIn("left to undo", message)
 
 
 if __name__ == "__main__":

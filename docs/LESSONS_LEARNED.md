@@ -149,3 +149,23 @@ start.
 
 **Takeaway**: reject empty search *before* counting matches. The uniqueness
 gate only means something for a non-empty needle.
+
+## `git revert`'s failure modes are three different things, and only one of them is abortable
+
+Measured directly (git 2.55.0, 2026-09-04) while designing the non-destructive
+`/undo`:
+
+| Situation | Exit | State left behind |
+|---|---|---|
+| Clean revert, including of a **root** commit | 0 | new revert commit |
+| Unrelated dirty/untracked file present | 0 | new revert commit |
+| Dirty or staged change on a path the commit touched | **128** | nothing modified, **no revert in progress** -- `git revert --abort` also fails with 128 |
+| Content conflict | **1** | `UU` in status, `.git/REVERT_HEAD` present, `git revert --abort` exits 0 and fully restores |
+
+**Takeaway**: never call `git revert --abort` unconditionally after a
+non-zero exit -- check `git rev-parse --git-path REVERT_HEAD` on disk first,
+because the exit-128 path has nothing to abort and turns a clean refusal
+into a confusing double failure. Also: `git diff-tree` needs `--root` or a
+root commit reports zero changed paths, and reverting a root commit works
+fine, so the old "can't auto-undo the repo's very first commit" refusal was
+an artifact of `reset --hard`, not a git limitation.
