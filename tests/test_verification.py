@@ -150,5 +150,80 @@ class TestNeedsRepair(unittest.TestCase):
         self.assertFalse(outcome.needs_repair)
 
 
+class TestStripAnsi(unittest.TestCase):
+    def test_removes_csi_sequences(self):
+        self.assertEqual(verification.strip_ansi("\x1b[31mred\x1b[0m"), "red")
+
+    def test_removes_osc_sequences(self):
+        self.assertEqual(verification.strip_ansi("\x1b]0;title\x07body"), "body")
+
+    def test_collapses_carriage_return_redraws(self):
+        self.assertEqual(
+            verification.strip_ansi("building 10%\rbuilding 50%\rbuilding 100%\ndone"),
+            "building 100%\ndone",
+        )
+
+
+class TestExtractFailureContext(unittest.TestCase):
+    def test_keeps_the_traceback_and_the_final_summary(self):
+        stdout = "\n".join(
+            ["noise"] * 200
+            + ["Traceback (most recent call last):",
+               '  File "calc.py", line 2, in divide',
+               "ZeroDivisionError: division by zero"]
+            + ["filler"] * 200
+            + ["FAILED (errors=1)"]
+        )
+        extracted = verification.extract_failure_context(stdout, "")
+        self.assertIn("Traceback (most recent call last):", extracted)
+        self.assertIn("ZeroDivisionError", extracted)
+        self.assertIn("FAILED (errors=1)", extracted)
+        self.assertNotIn("noise\nnoise\nnoise\nnoise\nnoise\nnoise", extracted)
+
+    def test_never_exceeds_the_cap(self):
+        extracted = verification.extract_failure_context("x" * 50_000, "y" * 50_000)
+        self.assertLessEqual(len(extracted), verification.FEEDBACK_MAX_CHARS)
+
+    def test_falls_back_to_the_tail_when_no_marker_matches(self):
+        stdout = "\n".join(f"line {i}" for i in range(500))
+        extracted = verification.extract_failure_context(stdout, "")
+        self.assertIn("line 499", extracted)
+        self.assertNotIn("line 0\n", extracted)
+
+    def test_empty_output_is_empty(self):
+        self.assertEqual(verification.extract_failure_context("", ""), "")
+
+
+class TestFailureFeedback(unittest.TestCase):
+    def _make_outcome(self, status, exit_code, stdout):
+        command = verification.VerificationCommand(
+            kind="unittest",
+            argv=[sys.executable, "-m", "unittest", "discover", "-q"],
+            label="python3 -m unittest discover -q",
+        )
+        result = verification.CommandResult(
+            kind="argv", display=command.label, status=status, exit_code=exit_code,
+            stdout=stdout, stderr="", duration_s=1.0, timeout_s=180, truncated=False,
+        )
+        return verification.VerificationOutcome(True, command, result, "")
+
+    def test_failed_feedback_shape(self):
+        text = verification.failure_feedback(
+            self._make_outcome(Status.FAILED, 1, "AssertionError: 1 != 2\nFAILED (failures=1)")
+        )
+        self.assertIn("--- VERIFICATION FAILED AFTER YOUR CHANGE ---", text)
+        self.assertIn("python3 -m unittest discover -q", text)
+        self.assertIn("exit code:\n1", text)
+        self.assertIn("AssertionError", text)
+        self.assertIn("```edit", text)
+        self.assertIn("--- END VERIFICATION RESULT ---", text)
+
+    def test_timeout_feedback_reports_the_timeout_instead_of_an_exit_code(self):
+        text = verification.failure_feedback(self._make_outcome(Status.TIMEOUT, None, "partial output"))
+        self.assertIn("timed out after 180s", text)
+        self.assertNotIn("exit code:", text)
+        self.assertIn("partial output", text)
+
+
 if __name__ == "__main__":
     unittest.main()

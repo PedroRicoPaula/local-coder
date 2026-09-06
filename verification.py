@@ -10,6 +10,7 @@ calls. Everything outside main.py's single repair call is plain Python.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import sys
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from context import tree
+from context.truncate import truncate_text
 from execution import CommandResult, Status
 
 FEEDBACK_MAX_CHARS = 2000
@@ -150,3 +152,97 @@ def discover(project_root: str, changed_paths: Sequence[str],
         # list.sort is stable, so within each group the table order decides.
         candidates.sort(key=lambda c: 0 if c.kind in promoted else 1)
     return candidates[0]
+
+
+LEAD_IN_LINES = 3
+WINDOW_LINES = 60
+TAIL_LINES = 15
+
+_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+# First match wins; the window opens three lines before it so the failing
+# test's own name is included.
+_MARKERS = [
+    re.compile(r"Traceback \(most recent call last\)"),
+    re.compile(r"^E   "),
+    re.compile(r"AssertionError"),
+    re.compile(r"SyntaxError"),
+    re.compile(r"^FAILED"),
+    re.compile(r"^FAIL\b"),
+    re.compile(r"^--- FAIL"),
+    re.compile(r"^ERROR[: ]"),
+    re.compile(r"^error\[E\d+\]"),
+    re.compile(r"^error:"),
+    re.compile(r"panicked at"),
+    re.compile(r"npm ERR!"),
+]
+
+
+def strip_ansi(text: str) -> str:
+    """CSI + OSC removal, then \\r-redraw collapsing: pytest/cargo/npm
+    progress bars would otherwise dominate a 2000-char budget with noise."""
+    text = _OSC_RE.sub("", text)
+    text = _CSI_RE.sub("", text)
+    return "\n".join(line.split("\r")[-1] for line in text.split("\n"))
+
+
+def extract_failure_context(stdout: str, stderr: str,
+                            max_chars: int = FEEDBACK_MAX_CHARS) -> str:
+    joined = "\n".join(
+        part for part in (strip_ansi(stdout or "").strip(), strip_ansi(stderr or "").strip())
+        if part
+    )
+    lines = joined.splitlines()
+    if not lines:
+        return ""
+
+    index = next(
+        (i for i, line in enumerate(lines) if any(m.search(line) for m in _MARKERS)),
+        None,
+    )
+    tail_start = max(0, len(lines) - TAIL_LINES)
+    if index is None:
+        kept = lines[max(0, len(lines) - WINDOW_LINES):]
+    else:
+        start = max(0, index - LEAD_IN_LINES)
+        end = min(len(lines), index + WINDOW_LINES)
+        kept = lines[start:end]
+        if end < len(lines):
+            # The summary line ("FAILED (failures=1)", "test result: FAILED",
+            # "2 passed, 1 failed") is where a 7B model orients fastest, so
+            # the tail is always included -- with an explicit "..." when it is
+            # not already contiguous with the marker window.
+            if tail_start > end:
+                kept = kept + ["..."] + lines[tail_start:]
+            else:
+                kept = lines[start:]
+
+    text = truncate_text("\n".join(kept), max_chars=max_chars)
+    # truncate_text's char-based fallback adds an elision marker on top of
+    # max_chars; this text is appended to a prompt on a machine where every
+    # character is paid for in prefill time, so the cap is hard.
+    return text if len(text) <= max_chars else text[:max_chars]
+
+
+def failure_feedback(outcome: VerificationOutcome) -> str:
+    """The labeled-field shape actions.format_action_error already
+    established for this model."""
+    command = outcome.command
+    result = outcome.result
+    if result.status is Status.TIMEOUT:
+        status_block = f"result:\ntimed out after {result.timeout_s}s"
+    else:
+        status_block = f"exit code:\n{result.exit_code}"
+    return "\n".join([
+        "--- VERIFICATION FAILED AFTER YOUR CHANGE ---",
+        "command:",
+        command.label,
+        status_block,
+        "output (trimmed):",
+        extract_failure_context(result.stdout, result.stderr),
+        "",
+        "Fix the cause with a single ```edit block on the file that is wrong.",
+        "Do not run commands, do not fetch, do not search.",
+        "--- END VERIFICATION RESULT ---",
+    ])
