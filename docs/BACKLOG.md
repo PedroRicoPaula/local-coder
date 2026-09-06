@@ -20,6 +20,19 @@ trigger condition actually happens.
 
 ## Done
 
+- **Slice B: deterministic verification -> repair** (`verification.py`,
+  `execution.py`, `config.py`, `main.py`). After a mutation, localcoder runs
+  the project's own check command -- discovered with filesystem checks only
+  (pytest / unittest / npm / cargo / go / `compileall` fallback), re-sorted
+  by the language of what actually changed -- as `argv` with `shell=False`,
+  behind its own y/N per execution. Passing costs zero extra model calls;
+  failing or timing out costs exactly one repair call followed by at most one
+  final verification that can never recurse. `execution.py` gained a
+  structured `CommandResult`/`Status` and a process-group kill on timeout;
+  `/verify` uses discovery instead of a hardcoded `compileall`; a stray `y`
+  at the REPL is a logged no-op instead of a phantom turn. See
+  `docs/superpowers/specs/2026-09-04-safe-verification-repair-design.md`.
+
 - **Slice A: blocking safety foundation** (`pathpolicy.py`, `textfile.py`,
   `actions.py`, `gitsafety.py`, `ui.py`). One path gate for every mutation
   (no `.git/**`, no credential/key files, `.gitignore`/`.github/` still

@@ -574,5 +574,56 @@ class TestRepairBound(unittest.TestCase):
         self.assertEqual(main.MAX_REPAIR_HOPS, 1)
 
 
+class TestReplBanner(unittest.TestCase):
+    def test_verify_line_describes_discovery_not_compileall(self):
+        self.assertIn("run this project's test/check command (discovered, confirmed)",
+                      main.BANNER)
+        self.assertNotIn("compile all Python files", main.BANNER)
+
+
+class TestReplVerifyAndYesNoNoop(unittest.TestCase):
+    def _run_repl(self, script: str, verify_side_effect):
+        """Drives main()'s REPL with a canned script, stubbing out every
+        network/subprocess dependency so nothing but the branch under test
+        actually happens."""
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("sys.stdin", io.StringIO(script)), \
+                 mock.patch("sys.argv", ["main.py"]), \
+                 mock.patch("main.Path.cwd", return_value=Path(root)), \
+                 mock.patch("ui._enabled", return_value=False), \
+                 mock.patch("main.OllamaClient") as llm, \
+                 mock.patch("main.CCEClient") as cce, \
+                 mock.patch("main.websearch.is_online", return_value=False), \
+                 mock.patch("main.build_tree", return_value="(tree)"), \
+                 mock.patch("main.load_skills", return_value=[]), \
+                 mock.patch("main.call_run_turn", create=True), \
+                 mock.patch("verification.verify_project",
+                            side_effect=verify_side_effect) as verify_project, \
+                 contextlib.redirect_stdout(buffer):
+                llm.return_value.is_up.return_value = True
+                cce.return_value.start.return_value = False
+                cce.return_value.available = False
+                main.main()
+        return verify_project, buffer.getvalue()
+
+    def test_verify_command_uses_discovery_and_makes_no_model_call(self):
+        outcome = mock.Mock(ran=True, skip_reason="")
+        verify_project, _ = self._run_repl("/verify\n/quit\n", [outcome])
+        verify_project.assert_called_once()
+        args = verify_project.call_args[0]
+        self.assertEqual(args[1], [])
+
+    def test_unsupported_project_is_reported_as_a_warning(self):
+        outcome = mock.Mock(ran=False, skip_reason="no verification command for this project")
+        _, printed = self._run_repl("/verify\n/quit\n", [outcome])
+        self.assertIn("no verification command for this project", printed)
+
+    def test_a_stray_yes_line_is_a_logged_no_op(self):
+        verify_project, printed = self._run_repl("y\nn\nYES\n/quit\n", [])
+        verify_project.assert_not_called()
+        self.assertEqual(printed.count("nada a confirmar agora -- linha ignorada"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,7 +47,7 @@ Type an instruction, or one of:
   /files <a.py> <b.py>   pin specific files as context for the next turn
   /context               show how the last turn's file context was chosen
   /why                   same as /context (scores + budget)
-  /verify                compile all Python files in this project (confirmed)
+  /verify                run this project's test/check command (discovered, confirmed)
   /agent <name> <task>   run a sub-agent once (test, refactor)
   /agents                list available sub-agents
   /model <name>          switch model for this session (e.g. qwen3:4b)
@@ -560,6 +560,11 @@ def main() -> None:
                 break
             if not line:
                 continue
+            if line.lower() in ("y", "n", "yes", "no"):
+                # A spare confirmation line in a piped script would otherwise
+                # be sent to the model as a full multi-minute phantom turn.
+                ui.info("nada a confirmar agora -- linha ignorada")
+                continue
 
             if line in ("/quit", "/exit"):
                 break
@@ -570,7 +575,11 @@ def main() -> None:
                 print_context_report()
                 continue
             if line == "/verify":
-                execution.apply_run(project_root, "python3 -m compileall -q .")
+                # A REPL command, not a turn: discovery happens inside
+                # verify_project and this path never calls the model.
+                outcome = verification.verify_project(project_root, [], verify_cfg)
+                if not outcome.ran:
+                    ui.warn(outcome.skip_reason)
                 continue
             if line == "/tree":
                 tree = build_tree(project_root, cfg["max_tree_entries"])

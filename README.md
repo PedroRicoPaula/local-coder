@@ -245,6 +245,53 @@ modified work is never swept into a `localcoder:` commit.
 Outside a git repo, the y/N prompt at write/delete time is the only safety
 net there is -- `git init` first if you want `/undo` available.
 
+## Verification and repair
+
+After a turn actually changed a file, localcoder runs the project's own
+check command and, if it fails, gives the model exactly one attempt to fix
+it. Nothing here involves an extra model call to *decide* anything --
+discovery is plain filesystem checks (`verification.py`).
+
+Discovery order (first match wins, and any candidate whose executable is
+missing from `PATH` is dropped):
+
+| Detected by | Command |
+|---|---|
+| `pytest.ini`, `[tool.pytest` in `pyproject.toml`, or `[tool:pytest]` in `setup.cfg` | `python -m pytest -q -x` |
+| `tests/test_*.py` | `python -m unittest discover -q -s tests -t .` |
+| top-level `test_*.py` | `python -m unittest discover -q` |
+| `package.json` with a real `scripts.test` | `npm test --silent` |
+| `Cargo.toml` | `cargo test --quiet` |
+| `go.mod` | `go test ./...` |
+| any `*.py` | `python -m compileall -q .` |
+| nothing above | nothing runs; localcoder says so and moves on |
+
+Before that order is applied, candidates are re-sorted by what the turn
+actually changed, so editing `src/lib.rs` in a polyglot repo picks `cargo`
+and editing a README picks nothing new.
+
+The rules that bound the cost:
+
+- **Every single verification execution needs its own y/N**, showing the
+  exact command. There is no once-per-session approval.
+- Commands run as `argv` with `shell=False`; no model output ever becomes an
+  argv element. A timeout (default 180s) kills the whole process group.
+- **Passing verification costs zero extra model calls.** Exit code 5 from
+  `unittest`/`pytest` means "no tests", not failure. A missing toolchain is
+  reported, never treated as a bug to repair.
+- A failure or timeout produces **exactly one** repair call, then at most one
+  final verification whose result is shown to you and never fed back to the
+  model. The absolute bound per turn is 4 model calls and 2 verification
+  executions.
+- `/verify` runs the same discovery on demand and makes **no** model call at
+  all.
+
+Config keys (`config.json`): `verify_after_change` (default `true` -- set it
+to `false` on slow hardware), `verify_timeout_s` (default `180`), and
+`verify_command` (default `null`; a list of strings like
+`["make", "check"]` overrides discovery entirely). The repair bound itself
+is deliberately not configurable.
+
 ## Repo layout
 
 ```
