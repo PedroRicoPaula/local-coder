@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import gitsafety
+import pathpolicy
 import ui
 from security import find_suspected_secrets
 
@@ -139,18 +140,6 @@ def strip_action_blocks(model_output: str) -> str:
     return text.strip()
 
 
-def _resolve_in_root(project_root: str, path: str) -> Path | None:
-    """Resolves `path` under `project_root`, refusing anything that escapes
-    it (a crafted `../../etc/passwd`-style path in a model-emitted block).
-    Returns None -- not an exception -- so callers can print one consistent
-    refusal message rather than handling this two different ways."""
-    root = Path(project_root).resolve()
-    target = (root / path).resolve()
-    if root not in target.parents and target != root:
-        return None
-    return target
-
-
 def format_action_error(
     *,
     action: str,
@@ -180,69 +169,72 @@ def unified_diff(path: str, old: str, new: str) -> str:
 
 
 def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bool:
-    target = _resolve_in_root(project_root, write.path)
-    if target is None:
-        ui.error(f"refusing to write outside project root: {write.path}")
+    decision = pathpolicy.resolve_for_mutation(project_root, write.path)
+    if not decision.ok:
+        ui.error(f"refusing to write {write.path}: {decision.reason}")
         return False
+    target = decision.path
+    rel = decision.relpath
 
     existed = target.exists()
     action = "overwrite" if existed else "create"
 
     suspects = find_suspected_secrets(write.content)
     if suspects:
-        ui.warn(f"{write.path} contains something shaped like a secret: {suspects[0][:12]}...")
+        ui.warn(f"{rel} contains something shaped like a secret: {suspects[0][:12]}...")
         ui.warn("this is a pattern-match warning, not a certainty -- check before confirming.")
 
     if confirm:
-        if not ui.confirm(f"  {action} {write.path} ({len(write.content)} bytes)?"):
-            ui.sub(f"skipped {write.path}")
+        if not ui.confirm(f"  {action} {rel} ({len(write.content)} bytes)?"):
+            ui.sub(f"skipped {rel}")
             return False
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(write.content)
-    ui.sub(f"{'wrote' if not existed else 'updated'} {write.path}")
-    gitsafety.commit_change(project_root, f"write {write.path}")
+    ui.sub(f"{'wrote' if not existed else 'updated'} {rel}")
+    gitsafety.commit_change(project_root, f"write {rel}")
     return True
 
 
 def apply_delete(project_root: str, path: str, confirm: bool = True) -> bool:
-    target = _resolve_in_root(project_root, path)
-    if target is None:
-        ui.error(f"refusing to delete outside project root: {path}")
+    decision = pathpolicy.resolve_for_mutation(project_root, path)
+    if not decision.ok:
+        ui.error(f"refusing to delete {path}: {decision.reason}")
         return False
+    target = decision.path
+    rel = decision.relpath
     if not target.exists():
-        ui.sub(f"{path} doesn't exist, nothing to delete")
-        return False
-    if target.is_dir():
-        ui.error(f"refusing to delete a directory ({path}) -- one file at a time")
+        ui.sub(f"{rel} doesn't exist, nothing to delete")
         return False
 
     if confirm:
-        if not ui.confirm(f"  delete {path}?"):
-            ui.sub(f"skipped {path}")
+        if not ui.confirm(f"  delete {rel}?"):
+            ui.sub(f"skipped {rel}")
             return False
 
     target.unlink()
-    ui.sub(f"deleted {path}")
-    gitsafety.commit_change(project_root, f"delete {path}")
+    ui.sub(f"deleted {rel}")
+    gitsafety.commit_change(project_root, f"delete {rel}")
     return True
 
 
 def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditResult:
-    target = _resolve_in_root(project_root, edit.path)
-    if target is None:
-        ui.error(f"refusing to edit outside project root: {edit.path}")
+    decision = pathpolicy.resolve_for_mutation(project_root, edit.path)
+    if not decision.ok:
+        ui.error(f"refusing to edit {edit.path}: {decision.reason}")
         return EditResult(
             False,
             format_action_error(
                 action="edit",
-                reason="path is outside project root",
+                reason=decision.reason,
                 path=edit.path,
-                suggestion="use a path relative to the project root",
+                suggestion=decision.suggestion,
             ),
         )
+    target = decision.path
+    rel = decision.relpath
     if not target.exists() or not target.is_file():
-        ui.error(f"{edit.path} does not exist")
+        ui.error(f"{rel} does not exist")
         return EditResult(
             False,
             format_action_error(
@@ -255,7 +247,7 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
 
     original = target.read_text(errors="replace")
     if not edit.search:
-        ui.error(f"edit {edit.path}: empty search block")
+        ui.error(f"edit {rel}: empty search block")
         return EditResult(
             False,
             format_action_error(
@@ -268,7 +260,7 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
     matches = original.count(edit.search)
     if matches != 1:
         reason = f"search block matched {matches} times (need exactly 1)"
-        ui.error(f"edit {edit.path}: {reason}")
+        ui.error(f"edit {rel}: {reason}")
         return EditResult(
             False,
             format_action_error(
@@ -282,19 +274,19 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
     updated = original.replace(edit.search, edit.replace, 1)
     suspects = find_suspected_secrets(edit.replace)
     if suspects:
-        ui.warn(f"{edit.path} edit contains something shaped like a secret: {suspects[0][:12]}...")
+        ui.warn(f"{rel} edit contains something shaped like a secret: {suspects[0][:12]}...")
         ui.warn("this is a pattern-match warning, not a certainty -- check before confirming.")
 
-    diff = unified_diff(edit.path, original, updated)
+    diff = unified_diff(rel, original, updated)
     if diff:
         ui.sub(diff.rstrip("\n"))
 
     if confirm:
-        if not ui.confirm(f"  apply edit to {edit.path}?"):
-            ui.sub(f"skipped {edit.path}")
+        if not ui.confirm(f"  apply edit to {rel}?"):
+            ui.sub(f"skipped {rel}")
             return EditResult(False)
 
     target.write_text(updated)
-    ui.sub(f"edited {edit.path}")
-    gitsafety.commit_change(project_root, f"edit {edit.path}")
+    ui.sub(f"edited {rel}")
+    gitsafety.commit_change(project_root, f"edit {rel}")
     return EditResult(True)

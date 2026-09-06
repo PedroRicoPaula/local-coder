@@ -233,5 +233,49 @@ class TestApplyEdit(unittest.TestCase):
         self.assertIn("+new", diff)
 
 
+class TestMutationPathPolicy(unittest.TestCase):
+    def test_write_refuses_git_internals(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, ".git").mkdir()
+            write = actions.FileWrite(path=".git/config", content="[core]\n")
+            self.assertFalse(actions.apply_write(root, write, confirm=False))
+            self.assertFalse(Path(root, ".git/config").exists())
+
+    def test_write_refuses_a_credential_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            write = actions.FileWrite(path=".env", content="TOKEN=abc\n")
+            self.assertFalse(actions.apply_write(root, write, confirm=False))
+            self.assertFalse(Path(root, ".env").exists())
+
+    def test_write_allows_gitignore(self):
+        with tempfile.TemporaryDirectory() as root:
+            write = actions.FileWrite(path=".gitignore", content="__pycache__/\n")
+            self.assertTrue(actions.apply_write(root, write, confirm=False))
+            self.assertEqual(Path(root, ".gitignore").read_text(), "__pycache__/\n")
+
+    def test_delete_refuses_git_internals(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, ".git").mkdir()
+            Path(root, ".git/config").write_text("[core]\n")
+            self.assertFalse(actions.apply_delete(root, ".git/config", confirm=False))
+            self.assertTrue(Path(root, ".git/config").exists())
+
+    def test_edit_refuses_credential_file_with_structured_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, ".env").write_text("TOKEN=abc\n")
+            result = actions.apply_edit(
+                root, actions.FileEdit(path=".env", search="abc", replace="xyz"), confirm=False
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("credential or key file", result.error)
+            self.assertIn("outside localcoder", result.error)
+            self.assertEqual(Path(root, ".env").read_text(), "TOKEN=abc\n")
+
+    def test_write_refuses_empty_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(actions.apply_write(root, actions.FileWrite(path="  ", content="x"),
+                                                 confirm=False))
+
+
 if __name__ == "__main__":
     unittest.main()

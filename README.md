@@ -180,6 +180,16 @@ explicit y/N, which is the real gate, matching OWASP's AI Agent Security
 Cheat Sheet guidance for agentic CLIs: never blanket-grant execution,
 always require approval for anything with real-world effect.
 
+`write`, `edit` and `delete` all resolve their target through one gate
+(`pathpolicy.py`) before anything else happens: nothing outside the project
+root, nothing inside `.git/` (component match, so `.gitignore`,
+`.gitattributes`, `.gitmodules` and `.github/` stay writable), nothing that
+`context/denylist.py` recognises as a credential or key file, and no
+directories. A refused `write`/`delete` is display-only; a refused `edit`
+also gets a structured `ERROR:` block so the model can retry with a
+different path. The escape hatch for a genuinely needed `.env` is to create
+it by hand, outside localcoder.
+
 ## Web search
 
 `websearch.py` scrapes DuckDuckGo's HTML-only endpoint
@@ -377,6 +387,9 @@ has no thinking-mode branch at all, so this doesn't affect the default.
 
 ## Security
 
+- **Model-emitted mutations can never touch git internals or credential
+  files:** `pathpolicy.resolve_for_mutation()` is the single gate all three
+  mutating actions call, so there is no second code path to keep in sync.
 - **Credential files never enter the model's context.** `context/denylist.py`
   (ported from CCE's own `denylist.rs`, prefix-family matching so `.env.local`
   and `id_ecdsa` are caught, not just `.env` and `id_rsa`) is checked both for
