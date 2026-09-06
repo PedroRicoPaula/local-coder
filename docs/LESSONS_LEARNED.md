@@ -138,3 +138,14 @@ check the full response shape first. The heuristic (`config.py`'s
 `CHARS_PER_TOKEN`) is still needed for *pre-flight* budgeting (before a
 call is made), but post-call accounting should always prefer the real
 number when the API provides one.
+
+## `str.count("")` is not zero
+
+**Symptom risk**: an `edit` whose SEARCH block is empty looks like "match
+nothing" but `original.count("")` returns `len(original) + 1`, so the
+uniqueness check (`== 1`) can fail for the wrong reason -- or, on a
+one-character file, pass and then `replace("", new, 1)` inserts at the
+start.
+
+**Takeaway**: reject empty search *before* counting matches. The uniqueness
+gate only means something for a non-empty needle.

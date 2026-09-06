@@ -27,7 +27,8 @@ from agents.registry import AgentRegistry
 from config import load_config
 from context.cce_client import CCEClient
 from context.denylist import is_denied
-from context.tree import build_tree, list_source_files
+from context.relevance import ScoredFile, format_selection, select_files_for_task
+from context.tree import build_tree
 from context.truncate import truncate_text
 from knowledge.loader import load_skills
 from llm import busy
@@ -40,12 +41,16 @@ NEAR_LIMIT_FRACTION = 0.98  # prompt_eval_count / num_ctx above this -> warn
 BANNER = """localcoder -- local, offline coding assistant (qwen2.5-coder via Ollama)
 Type an instruction, or one of:
   /files <a.py> <b.py>   pin specific files as context for the next turn
+  /context               show how the last turn's file context was chosen
+  /why                   same as /context (scores + budget)
+  /verify                compile all Python files in this project (confirmed)
   /agent <name> <task>   run a sub-agent once (test, refactor)
   /agents                list available sub-agents
   /model <name>          switch model for this session (e.g. qwen3:4b)
   /search <query>        search the web (only if online), shown here directly
   /undo                  revert the last change localcoder committed (git repos only)
   /tree                  reprint the project tree
+  /help                  reprint this list
   /quit                  exit
 """
 
@@ -183,9 +188,10 @@ def run_turn(
     initial_kv_context: list[int] | None = None,
 ) -> list[int] | None:
     """Streams a response, applies every action block it contains, and --
-    only if a ```run/```fetch/```search/```symbol actually produced output --
-    feeds that back for up to MAX_FOLLOWUP_TURNS more turns. write/delete
-    never trigger a follow-up: their confirmation message is context enough.
+    only if a ```run/```fetch/```search/```symbol produced output, or an
+    ```edit failed in a way the model can fix -- feeds that back for up to
+    MAX_FOLLOWUP_TURNS more turns. Successful write/edit/delete never
+    trigger a follow-up: their confirmation message is context enough.
     Each hop's action results are truncated (context/truncate.py -- CCE has
     no generic text-compression tool, only file/symbol-shaped ones) and the
     accumulated follow-up context is capped against max_total_context_chars,
@@ -246,6 +252,10 @@ def run_turn(
             ui.info(f"suggested command -- not run automatically:\n  $ {cmd}")
 
         action_results: list[str] = []
+        for edit in actions.extract_edits(output):
+            result = actions.apply_edit(project_root, edit)
+            if result.error:
+                action_results.append(truncate_text(result.error))
         for cmd in actions.extract_runs(output):
             result = execution.apply_run(project_root, cmd)
             if result:
@@ -377,6 +387,9 @@ def main() -> None:
     print(BANNER)
     tree = build_tree(project_root, cfg["max_tree_entries"])
     pinned_files: list[str] = []
+    last_selection: list[ScoredFile] = []
+    last_context_used_chars = 0
+    last_selection_pinned = False
     cce_died_warned = False
     reuse_across_turns = bool(cfg.get("reuse_context_across_turns", True))
     session_kv_context: list[int] | None = None
@@ -392,9 +405,11 @@ def main() -> None:
             cce_died_warned = True
 
     def build_context(paths: list[str], task_description: str) -> str:
+        nonlocal last_context_used_chars
         context, warnings = assemble_file_context(
             cce, project_root, paths, cfg["max_total_context_chars"], task_description
         )
+        last_context_used_chars = len(context)
         for w in warnings:
             ui.warn(w)
         if warnings:
@@ -403,6 +418,17 @@ def main() -> None:
                 "turno -- a resposta pode assentar em conteúdo incompleto"
             )
         return context
+
+    def print_context_report() -> None:
+        print(
+            format_selection(
+                last_selection,
+                budget_chars=cfg["max_total_context_chars"],
+                used_chars=last_context_used_chars,
+                num_ctx=cfg["num_ctx"],
+                pinned=last_selection_pinned,
+            )
+        )
 
     def call_run_turn(agent, task, ctx, initial_kv_context=None):
         """Wraps run_turn with the orphaned-generation check + advisory
@@ -436,6 +462,15 @@ def main() -> None:
 
             if line in ("/quit", "/exit"):
                 break
+            if line in ("/help", "/?"):
+                print(BANNER)
+                continue
+            if line in ("/context", "/why"):
+                print_context_report()
+                continue
+            if line == "/verify":
+                execution.apply_run(project_root, "python3 -m compileall -q .")
+                continue
             if line == "/tree":
                 tree = build_tree(project_root, cfg["max_tree_entries"])
                 session_kv_context = None  # tree text is part of what's cached; it just changed
@@ -452,6 +487,8 @@ def main() -> None:
             if line.startswith("/files "):
                 pinned_files = line.removeprefix("/files ").split()
                 session_kv_context = None  # pinned files change what's cached too
+                last_selection = [ScoredFile(p, 1.0) for p in pinned_files]
+                last_selection_pinned = bool(pinned_files)
                 ui.info(f"pinned: {', '.join(pinned_files) or '(none)'}")
                 continue
             if line.startswith("/model "):
@@ -476,6 +513,8 @@ def main() -> None:
                     ui.warn(f"unknown agent '{agent_name}'. try: {', '.join(sub_agents.names())}")
                     continue
                 check_cce_alive()
+                last_selection = [ScoredFile(p, 1.0) for p in pinned_files]
+                last_selection_pinned = bool(pinned_files)
                 context = build_context(pinned_files, task)
                 # A sub-agent has its own system prompt, so it can't share the
                 # main coder's cached kv_context -- and running it invalidates
@@ -487,7 +526,16 @@ def main() -> None:
 
             # Default: main coder turn.
             check_cce_alive()
-            files_for_context = pinned_files or list_source_files(project_root)[:5]
+            if pinned_files:
+                last_selection = [ScoredFile(p, 1.0) for p in pinned_files]
+                last_selection_pinned = True
+                files_for_context = pinned_files
+            else:
+                last_selection = select_files_for_task(project_root, line, limit=5)
+                last_selection_pinned = False
+                files_for_context = [item.path for item in last_selection]
+            if files_for_context:
+                ui.info("contexto: " + ", ".join(files_for_context))
             file_context = build_context(files_for_context, line)
             prompt = build_user_prompt(line, tree, file_context)
             kv_in = session_kv_context if reuse_across_turns else None

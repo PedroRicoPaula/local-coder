@@ -147,6 +147,24 @@ def _final_chunk(context: list[int] | None) -> dict:
     return chunk
 
 
+def _failed_edit_chunk(context: list[int] | None) -> dict:
+    chunk = {
+        "response": (
+            "```edit:nope.py\n"
+            "<<<<<<< SEARCH\n"
+            "missing\n"
+            "=======\n"
+            "new\n"
+            ">>>>>>> REPLACE\n"
+            "```"
+        ),
+        "done": True, "prompt_eval_count": 1, "eval_count": 1,
+    }
+    if context is not None:
+        chunk["context"] = context
+    return chunk
+
+
 class TestRunTurnKvContextThreading(unittest.TestCase):
     """run_turn's hop loop must (1) accept a caller-supplied kv_context to
     seed hop 0, (2) reuse whatever hop 0 returns on later hops by sending
@@ -238,6 +256,22 @@ class TestRunTurnKvContextThreading(unittest.TestCase):
         self.assertEqual(agent.calls[1][1], "")              # hop 1: delta only
         self.assertIsNone(agent.calls[2][2])                 # hop 2: budget blew -- cache dropped
         self.assertEqual(agent.calls[2][1], "FILECTX")       # hop 2: fallback resends full context
+
+    def test_failed_edit_feeds_structured_error_as_followup(self):
+        agent = _FakeAgent([[_failed_edit_chunk([10])], [_final_chunk([11])]])
+        cce = _FakeCCE(available=False)
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("ui._enabled", return_value=False):
+                main.run_turn(
+                    agent, "patch the file", "", root, cce,
+                    num_ctx=8192, max_total_context_chars=100_000,
+                )
+        self.assertEqual(len(agent.calls), 2)
+        hop1_task, hop1_ctx, hop1_kv = agent.calls[1]
+        self.assertEqual(hop1_kv, [10])
+        self.assertIn("ERROR:", hop1_task)
+        self.assertIn("does not exist", hop1_task)
+        self.assertIn("nope.py", hop1_task)
 
 
 class TestResolveModelConfig(unittest.TestCase):

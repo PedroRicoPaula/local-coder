@@ -47,6 +47,36 @@ class TestLiveEndToEnd(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fixed_calc.divide(1, 0)
 
+    def test_ranks_relevant_file_without_files_pin(self):
+        """Without /files, context used to be the 5 shallowest paths. A
+        decoy-filled tree must still get the auth module into context so
+        the model can fix it."""
+        with tempfile.TemporaryDirectory() as project:
+            for name in ("aaa.py", "bbb.py", "ccc.py", "ddd.py", "eee.py"):
+                Path(project, name).write_text("# decoy\n")
+            pkg = Path(project, "pkg")
+            pkg.mkdir()
+            (pkg / "auth.py").write_text("def divide(a, b):\n    return a / b\n")
+
+            script = (
+                "Fix the authentication divide function so it raises a clear "
+                "ValueError instead of a ZeroDivisionError when b is 0.\n"
+                "y\n"
+                "/quit\n"
+            )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "main.py")],
+                cwd=project, input=script, capture_output=True, text=True, timeout=600,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            sys.path.insert(0, str(pkg))
+            import auth as fixed_auth  # noqa: E402
+
+            self.assertEqual(fixed_auth.divide(4, 2), 2)
+            with self.assertRaises(ValueError):
+                fixed_auth.divide(1, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

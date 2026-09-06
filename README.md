@@ -38,31 +38,31 @@ localcoder
 ## What it does each turn
 
 1. Builds a compact tree of the current directory (`.gitignore`-aware).
-2. Compresses whichever files are in context through CCE (heuristic,
+2. Ranks source files against the task (path + keyword overlap; `/files`
+   still pins an explicit set) and compresses those through CCE (heuristic,
    near-instant, no LLM involved in this step) — falls back to raw file
    reads if the CCE binary isn't built yet. Any file that gets truncated or
    skipped to fit the context budget prints a visible warning (not just an
    inline marker only the model would see) -- see "Token usage & context
-   budget" below.
+   budget" below. `/context` (alias `/why`) reprints the last selection
+   and char budget.
 3. Injects any `.md` rule files from `skills/` into the system prompt.
 4. Streams the response from Ollama live, token by token, instead of
    sitting on a silent wait. A spinner covers the gap before the first
    token too -- connection + prompt prefill, the part that used to be pure
    silence -- and each response ends with a colored token-usage bar (see
    "Streaming" and "Token usage & context budget" below).
-5. Parses the complete reply for action blocks (write, delete, run, fetch,
+5. Parses the complete reply for action blocks (write, edit, delete, run, fetch,
    search, symbol, or a display-only shell suggestion) and applies each
    one, individually confirmed -- see "Actions" below.
-6. If a `run`, `fetch`, `search`, or `symbol` produced output, feeds it back
-   for up to two more automatic turns so the model can act on what it
-   learned (install a dependency, then use it; read a page, then write
-   against it; look up a search result, then use it; ask for an elided
-   function body, then read it) -- bounded, not an open-ended agent loop,
-   because each hop costs real CPU-minutes. Each hop's output is truncated
-   heuristically (CCE has no generic text-compression tool, only
-   file/symbol-shaped ones) and the accumulated follow-up context is capped
-   against the same budget, dropping older hop results before newer ones
-   rather than growing unboundedly.
+6. If a `run`, `fetch`, `search`, or `symbol` produced output, **or an
+   `edit` failed** (0 matches, ambiguous snippet, missing file), feeds that
+   back for up to two more automatic turns so the model can act on what it
+   learned. Successful write/edit/delete do not start a hop. Each hop's
+   output is truncated heuristically (CCE has no generic text-compression
+   tool, only file/symbol-shaped ones) and the accumulated follow-up
+   context is capped against the same budget, dropping older hop results
+   before newer ones rather than growing unboundedly.
 
 ## Streaming
 
@@ -155,12 +155,13 @@ exceeds the derived safe cap.
 
 ## Actions
 
-Seven fenced-block kinds, all sharing the same variable-length-fence
+Eight fenced-block kinds, all sharing the same variable-length-fence
 convention (`actions.py`):
 
 | Block | Effect | Confirmed? | Fed back to the model? |
 |---|---|---|---|
 | ` ```write:path ` | create/replace a file | yes, y/N | no |
+| ` ```edit:path ` | replace one unique snippet (`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`); refuses 0 or 2+ matches; shows a unified diff before y/N | yes, y/N | **only on failure** (structured ERROR block, up to 2 hops) |
 | ` ```delete:path ` | remove a file | yes, y/N | no |
 | ` ```run ` | execute a shell command | yes, y/N, plus a denylist that refuses catastrophic patterns without even prompting | yes, up to 2 hops |
 | ` ```fetch:url ` | fetch a web page as text | yes, y/N, http(s) only, skipped immediately if offline | yes, up to 2 hops |
@@ -210,7 +211,7 @@ it's offline.
 
 ## Git safety net
 
-If the current directory is a git repo, every confirmed `write`/`delete` is
+If the current directory is a git repo, every confirmed `write`/`edit`/`delete` is
 auto-committed with a `localcoder: ` prefixed message (`gitsafety.py`).
 `/undo` reverts the last commit -- but only if its message has that prefix,
 so it can never discard a commit that was actually your own work, and it
@@ -228,6 +229,7 @@ config.py, config.json    model, host, timeouts, budgets (max_total_context_char
                           derived from num_ctx unless set explicitly)
 context/
   tree.py                project tree walker
+  relevance.py             keyword ranking for which files enter the prompt
   cce_client.py            MCP client wrapping the CCE binary
   denylist.py               credential/key files, never sent as context
   truncate.py                heuristic head+tail truncation for text CCE can't compress
@@ -248,7 +250,7 @@ mcp/
   client.py                  generic stdio MCP client (JSON-RPC), reusable
                               for any future MCP server, not just CCE
 mcp.servers.json               MCP server list (context-compressor pre-wired)
-actions.py                      parses all seven action blocks, applies write/delete
+actions.py                      parses all eight action blocks, applies write/edit/delete
 execution.py                     runs ```run blocks (denylist + confirm + capture)
 webfetch.py                      fetches ```fetch blocks (confirm + HTML-to-text)
 websearch.py                      DuckDuckGo HTML scrape for ```search blocks + /search
@@ -380,10 +382,11 @@ has no thinking-mode branch at all, so this doesn't affect the default.
   and `id_ecdsa` are caught, not just `.env` and `id_rsa`) is checked both for
   auto-selected files and anything passed to `/files` explicitly — a denied
   path is refused with a visible message, not silently dropped.
-- **Every file write requires a y/N confirmation** (`actions.py`); nothing is
-  written without it, and a write path is checked against the project root
+- **Every file write or edit requires a y/N confirmation** (`actions.py`); nothing is
+  written without it, and a write/edit path is checked against the project root
   before that prompt even appears (no `../../etc/passwd` via a crafted
-  `write:` block).
+  `write:`/`edit:` block). `edit` also refuses a SEARCH snippet that matches
+  0 or 2+ times, so it cannot silently rewrite the wrong occurrence.
 - **Shell commands are never executed**, only ever printed as a suggestion —
   matching the standard guidance for agentic CLIs (OWASP's AI Agent Security
   Cheat Sheet: allowlist tools, never grant blanket shell access, require
@@ -409,7 +412,7 @@ python3 -m unittest discover tests
 
 Pure-logic tests (denylist, secret-pattern scan, action-block parsing
 including the nested-fence case, tree sorting/filtering, config merging,
-the command denylist, git commit/undo) run in well under a second, no
+the command denylist, git commit/undo, edit uniqueness, keyword ranking) run in well under a second, no
 Ollama or network needed. The one true end-to-end test is opt-in and slow
 for the same reason everything on this hardware is slow:
 
@@ -417,10 +420,11 @@ for the same reason everything on this hardware is slow:
 LOCALCODER_LIVE_TESTS=1 python3 -m unittest tests.test_live
 ```
 
-It spawns `main.py` for real against a real running Ollama, feeds it an
-actual bug (`ZeroDivisionError` → should become a clear `ValueError`), and
-checks the *behavior* of the resulting code (imports it and calls the
-function) rather than grepping the source text for a particular phrasing.
+It spawns `main.py` for real against a real running Ollama. Two cases:
+a pinned one-file project, and a decoy-filled tree where the relevant
+module is *not* among the shallowest paths (so ranking has to work). Both
+check the *behavior* of the resulting code (import and call) rather than
+grepping the source text for a particular phrasing.
 
 ## Deferred: multi-context / subagent chunking
 
@@ -499,8 +503,8 @@ see `docs/LESSONS_LEARNED.md` for the full investigation):
   change that fixes a 2017 dual-core CPU.
 - **No conversation memory across turns, still.** Each turn is a fresh
   `generate()` call with fresh context assembly — "no, the other file"
-  won't work; be explicit each time, or use `/files` to pin what's
-  relevant. What *did* change: turns within the same session now reuse
+  won't work as conversation memory; ranking now picks files from the task
+  keywords, and `/files` still pins an explicit set. What *did* change: turns within the same session now reuse
   Ollama's `context` token array from the previous turn purely to skip
   re-prefilling the (identical) system prompt from zero -- see "Context
   reuse" below. That's a prefill-speed optimization, not memory: the model

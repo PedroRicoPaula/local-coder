@@ -20,6 +20,19 @@ trigger condition actually happens.
 
 ## Done
 
+- **`edit` action + ranked context + `/context`** (`actions.py`,
+  `context/relevance.py`, `main.py`). Default file selection is no longer
+  "the 5 shallowest source paths" -- files are scored from the task
+  (path/stem overlap + a capped content scan). ` ```edit:path ` applies a
+  unique SEARCH/REPLACE snippet, shows a unified diff, refuses 0/2+
+  matches and empty search (`str.count("")` is not 0), and failed edits
+  feed a labeled ERROR block into the existing follow-up hop loop so
+  qwen2.5-coder:7b can retry without a full-file rewrite. `/context` and
+  `/why` reprint the last selection and char budget; `/verify` runs
+  `compileall` behind the same y/N as ```run. Fast tests cover parser,
+  ranking, and the failed-edit hop; `tests.test_live` gained a decoy-tree
+  case that does **not** use `/files`.
+
 - **Ollama `context`-array reuse, within-turn and cross-turn**
   (`llm/ollama_client.py`, `agents/base.py`, `main.py`). Root cause
   confirmed via ollama/ollama#14780: the CPU backend never reuses KV cache
