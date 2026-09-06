@@ -26,7 +26,47 @@ class TestIsGitRepo(unittest.TestCase):
 class TestCommitAndUndo(unittest.TestCase):
     def test_commit_change_never_raises_outside_repo(self):
         with tempfile.TemporaryDirectory() as root:
-            gitsafety.commit_change(root, "should be a silent no-op")  # must not raise
+            gitsafety.commit_change(root, "should be a silent no-op", ["a.py"])  # must not raise
+
+    def test_commit_change_stages_only_the_named_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "seed.txt").write_text("seed\n")
+            subprocess.run(["git", "add", "seed.txt"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+
+            # The user's own separate work, deliberately staged.
+            Path(root, "b.py").write_text("users_work = True\n")
+            subprocess.run(["git", "add", "b.py"], cwd=root, check=True)
+
+            Path(root, "a.py").write_text("x = 1\n")
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
+
+            committed = subprocess.run(
+                ["git", "show", "--name-only", "--pretty=format:", "HEAD"],
+                cwd=root, capture_output=True, text=True, check=True,
+            ).stdout.split()
+            self.assertEqual(committed, ["a.py"])
+
+            still_staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=root, capture_output=True, text=True, check=True,
+            ).stdout.split()
+            self.assertEqual(still_staged, ["b.py"])
+
+    def test_commit_change_creates_no_commit_when_nothing_changed(self):
+        with tempfile.TemporaryDirectory() as root:
+            _init_repo(root)
+            Path(root, "a.py").write_text("x = 1\n")
+            subprocess.run(["git", "add", "a.py"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=root, check=True)
+
+            before = subprocess.run(["git", "rev-list", "--count", "HEAD"],
+                                    cwd=root, capture_output=True, text=True, check=True).stdout
+            gitsafety.commit_change(root, "write a.py", ["a.py"])  # content identical
+            after = subprocess.run(["git", "rev-list", "--count", "HEAD"],
+                                   cwd=root, capture_output=True, text=True, check=True).stdout
+            self.assertEqual(before, after)
 
     def test_commit_then_undo_roundtrip(self):
         with tempfile.TemporaryDirectory() as root:
@@ -41,7 +81,7 @@ class TestCommitAndUndo(unittest.TestCase):
 
             target = Path(root) / "a.py"
             target.write_text("x = 1\n")
-            gitsafety.commit_change(root, "write a.py")
+            gitsafety.commit_change(root, "write a.py", ["a.py"])
 
             ok, message = gitsafety.undo_last(root)
             self.assertTrue(ok, message)
@@ -53,7 +93,7 @@ class TestCommitAndUndo(unittest.TestCase):
             _init_repo(root)
             target = Path(root) / "a.py"
             target.write_text("x = 1\n")
-            gitsafety.commit_change(root, "write a.py")  # this is the ONLY commit
+            gitsafety.commit_change(root, "write a.py", ["a.py"])  # this is the ONLY commit
 
             ok, message = gitsafety.undo_last(root)
             self.assertFalse(ok)

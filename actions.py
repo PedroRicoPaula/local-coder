@@ -192,7 +192,7 @@ def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bo
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(write.content)
     ui.sub(f"{'wrote' if not existed else 'updated'} {rel}")
-    gitsafety.commit_change(project_root, f"write {rel}")
+    gitsafety.commit_change(project_root, f"write {rel}", [rel])
     return True
 
 
@@ -214,7 +214,7 @@ def apply_delete(project_root: str, path: str, confirm: bool = True) -> bool:
 
     target.unlink()
     ui.sub(f"deleted {rel}")
-    gitsafety.commit_change(project_root, f"delete {rel}")
+    gitsafety.commit_change(project_root, f"delete {rel}", [rel])
     return True
 
 
@@ -288,5 +288,5 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
 
     target.write_text(updated)
     ui.sub(f"edited {rel}")
-    gitsafety.commit_change(project_root, f"edit {rel}")
+    gitsafety.commit_change(project_root, f"edit {rel}", [rel])
     return EditResult(True)

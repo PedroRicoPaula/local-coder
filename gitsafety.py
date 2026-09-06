@@ -11,6 +11,7 @@ a failed action to the user.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 import subprocess
 
 COMMIT_PREFIX = "localcoder: "
@@ -27,13 +28,31 @@ def is_git_repo(project_root: str) -> bool:
         return False
 
 
-def commit_change(project_root: str, message: str) -> None:
+def commit_change(project_root: str, message: str, paths: Sequence[str]) -> None:
+    """Stages and commits ONLY `paths`. Broad staging could sweep a user's
+    unrelated modified or staged work into a `localcoder:` commit; the
+    commit pathspec leaves separately staged files staged and uncommitted.
+    Every git error is still swallowed -- the on-disk action already
+    succeeded, and a failed safety-net commit must never look like a failed
+    action."""
     if not is_git_repo(project_root):
         return
+    pathspec = [p for p in paths if p]
+    if not pathspec:
+        return
     try:
-        subprocess.run(["git", "add", "-A"], cwd=project_root, capture_output=True, timeout=10)
         subprocess.run(
-            ["git", "commit", "-m", f"{COMMIT_PREFIX}{message}"],
+            ["git", "add", "--", *pathspec],
+            cwd=project_root, capture_output=True, timeout=10,
+        )
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--", *pathspec],
+            cwd=project_root, capture_output=True, timeout=10,
+        )
+        if staged.returncode == 0:
+            return
+        subprocess.run(
+            ["git", "commit", "-m", f"{COMMIT_PREFIX}{message}", "--", *pathspec],
             cwd=project_root, capture_output=True, timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
