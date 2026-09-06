@@ -63,6 +63,15 @@ class TestReadWriteRoundTrip(unittest.TestCase):
             with self.assertRaises(UnicodeDecodeError):
                 textfile.read(path)
 
+    def test_write_with_unpaired_surrogate_does_not_truncate_existing_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root, "keep.txt")
+            original = b"original content\n"
+            path.write_bytes(original)
+            with self.assertRaises(UnicodeEncodeError):
+                textfile.write(path, "bad \ud800\n", bom=False)
+            self.assertEqual(path.read_bytes(), original)
+
 
 class TestToEol(unittest.TestCase):
     def test_renders_lf_source_as_crlf(self):

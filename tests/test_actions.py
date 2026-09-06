@@ -179,7 +179,27 @@ class TestApplyWriteByteFidelity(unittest.TestCase):
         new = "".join(f"changed {i}\n" for i in range(1000))
         capped = actions._cap_diff(actions.unified_diff("big.txt", old, new))
         self.assertIn("diff lines elided", capped)
-        self.assertLessEqual(len(capped.splitlines()), actions.MAX_DIFF_LINES + 1)
+        self.assertEqual(len(capped.splitlines()), actions.MAX_DIFF_LINES)
+
+    def test_diff_at_max_passes_through(self):
+        diff = "\n".join(f"line {i}" for i in range(actions.MAX_DIFF_LINES))
+        self.assertEqual(len(actions._cap_diff(diff).splitlines()), actions.MAX_DIFF_LINES)
+
+    def test_diff_one_over_max_is_capped_to_max(self):
+        diff = "\n".join(f"line {i}" for i in range(actions.MAX_DIFF_LINES + 1))
+        capped = actions._cap_diff(diff)
+        self.assertEqual(len(capped.splitlines()), actions.MAX_DIFF_LINES)
+        self.assertIn("diff lines elided", capped)
+
+    def test_refuses_to_write_unpaired_surrogate_without_altering_existing(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "safe.txt")
+            original = b"keep me\n"
+            target.write_bytes(original)
+            write = actions.FileWrite(path="safe.txt", content="bad \ud800\n")
+            with mock.patch("builtins.input", side_effect=AssertionError("should never prompt")):
+                self.assertFalse(actions.apply_write(root, write, confirm=True))
+            self.assertEqual(target.read_bytes(), original)
 
 
 class TestApplyWrite(unittest.TestCase):

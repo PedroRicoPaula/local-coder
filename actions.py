@@ -48,7 +48,7 @@ EDIT_BODY_RE = re.compile(
 )
 
 MAX_DIFF_LINES = 200
-DIFF_HEAD_LINES = 150
+DIFF_HEAD_LINES = 149
 DIFF_TAIL_LINES = 50
 
 
@@ -223,6 +223,12 @@ def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bo
         ui.sub(f"{rel} already has this content -- nothing to write")
         return False
 
+    try:
+        textfile.encode_bytes(rendered, bom=bom)
+    except UnicodeEncodeError:
+        ui.error(f"refusing to write {rel}: content is not valid UTF-8")
+        return False
+
     suspects = find_suspected_secrets(write.content)
     if suspects:
         ui.warn(f"{rel} contains something shaped like a secret: {suspects[0][:12]}...")
@@ -242,7 +248,7 @@ def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bo
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         textfile.write(target, rendered, bom=bom)
-    except OSError as e:
+    except (OSError, UnicodeEncodeError) as e:
         ui.error(f"could not write {rel}: {e}")
         return False
 

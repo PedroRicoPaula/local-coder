@@ -49,11 +49,15 @@ def read(path: Path) -> TextFile:
     return TextFile(text=text, eol=eol, bom=bom, mixed_eol=mixed)
 
 
+def encode_bytes(text: str, *, bom: bool) -> bytes:
+    """Encode to UTF-8 before touching the file so a surrogate or other
+    unencodable character cannot truncate an existing target."""
+    payload = (BOM if bom else "") + text
+    return payload.encode("utf-8")
+
+
 def write(path: Path, text: str, *, bom: bool) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        if bom:
-            handle.write(BOM)
-        handle.write(text)
+    path.write_bytes(encode_bytes(text, bom=bom))
 
 
 def to_eol(text: str, eol: str) -> str:
