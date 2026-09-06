@@ -55,8 +55,7 @@ trigger condition actually happens.
   matches and empty search (`str.count("")` is not 0), and failed edits
   feed a labeled ERROR block into the existing follow-up hop loop so
   qwen2.5-coder:7b can retry without a full-file rewrite. `/context` and
-  `/why` reprint the last selection and char budget; `/verify` runs
-  `compileall` behind the same y/N as ```run. Fast tests cover parser,
+  `/why` reprint the last selection and char budget. Fast tests cover parser,
   ranking, and the failed-edit hop; `tests.test_live` gained a decoy-tree
   case that does **not** use `/files`.
 

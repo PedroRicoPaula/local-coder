@@ -465,11 +465,15 @@ has no thinking-mode branch at all, so this doesn't affect the default.
   before that prompt even appears (no `../../etc/passwd` via a crafted
   `write:`/`edit:` block). `edit` also refuses a SEARCH snippet that matches
   0 or 2+ times, so it cannot silently rewrite the wrong occurrence.
-- **Shell commands are never executed**, only ever printed as a suggestion —
-  matching the standard guidance for agentic CLIs (OWASP's AI Agent Security
-  Cheat Sheet: allowlist tools, never grant blanket shell access, require
-  approval for high-impact actions). There is no code path in this project
-  that runs a shell command the model proposed.
+- **Model-proposed ` ```run ` commands execute only after an explicit y/N**,
+  and a denylist refuses catastrophic patterns (`rm -rf`, `mkfs`, `dd`,
+  fork bomb, `shutdown`/`reboot`, raw devices, `sudo`) without prompting.
+  ` ```shell ` is the suggestion-only block and never runs. Verification
+  commands are discovered from the project (or taken from `verify_command`
+  in config) and run as argv with `shell=False` -- no model string ever
+  becomes an argv element. This matches OWASP's AI Agent Security Cheat
+  Sheet: allowlist tools, never grant blanket shell access, require
+  approval for high-impact actions.
 - **`security.py` scans generated file content for secret-shaped strings**
   (AWS keys, PEM headers, `sk-`/`ghp_`-style tokens, `key = "..."` patterns)
   before the write confirmation prompt, and flags a match inline. This is a
