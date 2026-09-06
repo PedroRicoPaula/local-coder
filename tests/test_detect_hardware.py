@@ -44,14 +44,17 @@ class TestPhysicalCores(unittest.TestCase):
 
     def test_unreadable_proc_cpuinfo_falls_back_to_cpu_count(self):
         with mock.patch.object(Path, "read_text", side_effect=OSError), mock.patch(
-            "os.cpu_count", return_value=8
-        ):
+            "detect_hardware._sysctl_int", return_value=None
+        ), mock.patch("os.cpu_count", return_value=8):
             self.assertEqual(dh._physical_cores(), 8)
 
 
 class TestGpu(unittest.TestCase):
     def test_no_nvidia_smi_means_no_gpu(self):
-        with mock.patch("shutil.which", return_value=None):
+        uname = mock.Mock(machine="x86_64")
+        with mock.patch("shutil.which", return_value=None), mock.patch(
+            "os.uname", return_value=uname
+        ):
             self.assertEqual(dh._gpu(), (False, None))
 
     def test_nvidia_smi_present_but_no_driver_reports_no_gpu(self):
@@ -61,8 +64,39 @@ class TestGpu(unittest.TestCase):
         but fails to actually talk to a card (e.g. a stale/partial driver
         install)."""
         failed = mock.Mock(returncode=1, stdout="")
+        uname = mock.Mock(machine="x86_64")
         with mock.patch("shutil.which", return_value="/usr/bin/nvidia-smi"), mock.patch(
             "subprocess.run", return_value=failed
+        ), mock.patch("os.uname", return_value=uname):
+            self.assertEqual(dh._gpu(), (False, None))
+
+
+class TestDarwinSysctl(unittest.TestCase):
+    def test_physical_cores_reads_sysctl_when_proc_missing(self):
+        sysctl = mock.Mock(returncode=0, stdout="8\n")
+        with mock.patch.object(Path, "read_text", side_effect=OSError), mock.patch(
+            "subprocess.run", return_value=sysctl
+        ):
+            self.assertEqual(dh._physical_cores(), 8)
+
+    def test_ram_gb_reads_hw_memsize_when_proc_missing(self):
+        sysctl = mock.Mock(returncode=0, stdout=str(16 * 1024**3) + "\n")
+        with mock.patch.object(Path, "read_text", side_effect=OSError), mock.patch(
+            "subprocess.run", return_value=sysctl
+        ):
+            self.assertAlmostEqual(dh._ram_gb(), 16.0, places=1)
+
+    def test_arm64_darwin_counts_as_gpu_without_nvidia(self):
+        uname = mock.Mock(machine="arm64")
+        with mock.patch("shutil.which", return_value=None), mock.patch(
+            "os.uname", return_value=uname
+        ):
+            self.assertEqual(dh._gpu(), (True, None))
+
+    def test_intel_mac_without_nvidia_is_not_gpu(self):
+        uname = mock.Mock(machine="x86_64")
+        with mock.patch("shutil.which", return_value=None), mock.patch(
+            "os.uname", return_value=uname
         ):
             self.assertEqual(dh._gpu(), (False, None))
 
