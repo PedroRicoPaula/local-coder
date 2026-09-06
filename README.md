@@ -160,7 +160,7 @@ convention (`actions.py`):
 
 | Block | Effect | Confirmed? | Fed back to the model? |
 |---|---|---|---|
-| ` ```write:path ` | create/replace a file | yes, y/N | no |
+| ` ```write:path ` | create/replace a file; preserves the existing file's CRLF/LF and UTF-8 BOM, refuses a non-UTF-8 target, shows a unified diff (capped at 200 lines) before overwriting, and skips silently when the content is already identical | yes, y/N | no |
 | ` ```edit:path ` | replace one unique snippet (`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`); refuses 0 or 2+ matches; shows a unified diff before y/N | yes, y/N | **only on failure** (structured ERROR block, up to 2 hops) |
 | ` ```delete:path ` | remove a file | yes, y/N | no |
 | ` ```run ` | execute a shell command | yes, y/N, plus a denylist that refuses catastrophic patterns without even prompting | yes, up to 2 hops |

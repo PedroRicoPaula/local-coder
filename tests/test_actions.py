@@ -1,6 +1,9 @@
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import actions
 
@@ -116,6 +119,67 @@ class TestFormatActionError(unittest.TestCase):
         self.assertIn("search block matched 0 times", msg)
         self.assertIn("src/auth.py", msg)
         self.assertIn("inspect the current file", msg)
+
+
+class TestApplyWriteByteFidelity(unittest.TestCase):
+    def test_overwriting_a_crlf_file_keeps_crlf(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "win.txt")
+            target.write_bytes(b"one\r\ntwo\r\n")
+            write = actions.FileWrite(path="win.txt", content="one\nthree\n")
+            self.assertTrue(actions.apply_write(root, write, confirm=False))
+            self.assertEqual(target.read_bytes(), b"one\r\nthree\r\n")
+
+    def test_overwriting_a_bom_file_keeps_the_bom(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "bom.txt")
+            target.write_bytes(b"\xef\xbb\xbfold\n")
+            write = actions.FileWrite(path="bom.txt", content="new\n")
+            self.assertTrue(actions.apply_write(root, write, confirm=False))
+            self.assertEqual(target.read_bytes(), b"\xef\xbb\xbfnew\n")
+
+    def test_new_file_gets_lf_and_no_bom(self):
+        with tempfile.TemporaryDirectory() as root:
+            write = actions.FileWrite(path="fresh.txt", content="a\r\nb\r\n")
+            self.assertTrue(actions.apply_write(root, write, confirm=False))
+            self.assertEqual(Path(root, "fresh.txt").read_bytes(), b"a\nb\n")
+
+    def test_refuses_to_overwrite_a_non_utf8_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "latin1.txt")
+            target.write_bytes(b"caf\xe9\n")
+            write = actions.FileWrite(path="latin1.txt", content="cafe\n")
+            self.assertFalse(actions.apply_write(root, write, confirm=False))
+            self.assertEqual(target.read_bytes(), b"caf\xe9\n")
+
+    def test_identical_content_is_skipped_without_prompting(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "same.txt")
+            target.write_text("x = 1\n")
+            write = actions.FileWrite(path="same.txt", content="x = 1\n")
+            with mock.patch("builtins.input", side_effect=AssertionError("should never prompt")):
+                self.assertFalse(actions.apply_write(root, write, confirm=True))
+
+    def test_overwrite_shows_a_unified_diff_before_the_prompt(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "a.py").write_text("old\n")
+            write = actions.FileWrite(path="a.py", content="new\n")
+            buffer = io.StringIO()
+            with mock.patch("ui._enabled", return_value=False), \
+                 contextlib.redirect_stdout(buffer), \
+                 mock.patch("builtins.input", return_value="n"):
+                actions.apply_write(root, write, confirm=True)
+            printed = buffer.getvalue()
+            self.assertIn("--- a.py", printed)
+            self.assertIn("-old", printed)
+            self.assertIn("+new", printed)
+
+    def test_a_huge_diff_is_capped(self):
+        old = "".join(f"line {i}\n" for i in range(1000))
+        new = "".join(f"changed {i}\n" for i in range(1000))
+        capped = actions._cap_diff(actions.unified_diff("big.txt", old, new))
+        self.assertIn("diff lines elided", capped)
+        self.assertLessEqual(len(capped.splitlines()), actions.MAX_DIFF_LINES + 1)
 
 
 class TestApplyWrite(unittest.TestCase):

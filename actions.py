@@ -28,6 +28,7 @@ from pathlib import Path
 
 import gitsafety
 import pathpolicy
+import textfile
 import ui
 from security import find_suspected_secrets
 
@@ -45,6 +46,24 @@ EDIT_BODY_RE = re.compile(
     r"<<<<<<< SEARCH\n(.*?)=======\n(.*?)>>>>>>> REPLACE",
     re.DOTALL,
 )
+
+MAX_DIFF_LINES = 200
+DIFF_HEAD_LINES = 150
+DIFF_TAIL_LINES = 50
+
+
+def _cap_diff(diff: str) -> str:
+    """A whole-file rewrite can produce thousands of diff lines; the human
+    reading the y/N prompt needs the shape of the change, not all of it."""
+    lines = diff.splitlines()
+    if len(lines) <= MAX_DIFF_LINES:
+        return diff
+    elided = len(lines) - DIFF_HEAD_LINES - DIFF_TAIL_LINES
+    return "\n".join(
+        lines[:DIFF_HEAD_LINES]
+        + [f"...({elided} diff lines elided)..."]
+        + lines[-DIFF_TAIL_LINES:]
+    )
 
 
 @dataclass
@@ -177,20 +196,56 @@ def apply_write(project_root: str, write: FileWrite, confirm: bool = True) -> bo
     rel = decision.relpath
 
     existed = target.exists()
-    action = "overwrite" if existed else "create"
+    if existed:
+        try:
+            current = textfile.read(target)
+        except UnicodeDecodeError:
+            # The y/N prompt is the real gate, and a prompt we cannot show a
+            # diff for is not a gate. Escape hatch: an explicit (confirmed)
+            # `delete`, then a `write`.
+            ui.error(f"refusing to overwrite {rel}: file is not valid UTF-8")
+            return False
+        except OSError as e:
+            ui.error(f"refusing to overwrite {rel}: could not read the file: {e}")
+            return False
+        if current.mixed_eol:
+            label = "CRLF" if current.eol == "\r\n" else "LF"
+            ui.warn(f"{rel} has mixed line endings; writing all lines as {label}")
+        old_text = current.text
+        rendered = textfile.to_eol(write.content, current.eol)
+        bom = current.bom
+    else:
+        old_text = ""
+        rendered = textfile.to_eol(write.content, "\n")
+        bom = False
+
+    if existed and rendered == old_text:
+        ui.sub(f"{rel} already has this content -- nothing to write")
+        return False
 
     suspects = find_suspected_secrets(write.content)
     if suspects:
         ui.warn(f"{rel} contains something shaped like a secret: {suspects[0][:12]}...")
         ui.warn("this is a pattern-match warning, not a certainty -- check before confirming.")
 
-    if confirm:
-        if not ui.confirm(f"  {action} {rel} ({len(write.content)} bytes)?"):
-            ui.sub(f"skipped {rel}")
-            return False
+    # Compare on LF-normalized text so a CRLF file does not show every line
+    # as changed just because the EOLs round-tripped.
+    diff = unified_diff(rel, old_text.replace("\r\n", "\n"), rendered.replace("\r\n", "\n"))
+    if diff:
+        ui.sub(_cap_diff(diff).rstrip("\n"))
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(write.content)
+    action = "overwrite" if existed else "create"
+    if confirm and not ui.confirm(f"  {action} {rel} ({len(write.content)} bytes)?"):
+        ui.sub(f"skipped {rel}")
+        return False
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        textfile.write(target, rendered, bom=bom)
+    except OSError as e:
+        ui.error(f"could not write {rel}: {e}")
+        return False
+
     ui.sub(f"{'wrote' if not existed else 'updated'} {rel}")
     gitsafety.commit_change(project_root, f"write {rel}", [rel])
     return True
