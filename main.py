@@ -256,6 +256,16 @@ def run_turn(
             result = actions.apply_edit(project_root, edit)
             if result.error:
                 action_results.append(truncate_text(result.error))
+        for bad in actions.extract_malformed_edits(output):
+            action_results.append(truncate_text(actions.format_action_error(
+                action="edit",
+                reason="edit block is not a valid SEARCH/REPLACE pair",
+                path=bad.path,
+                suggestion=(
+                    "use exactly:\n<<<<<<< SEARCH\n<the old lines>\n=======\n"
+                    "<the new lines>\n>>>>>>> REPLACE"
+                ),
+            )))
         for cmd in actions.extract_runs(output):
             result = execution.apply_run(project_root, cmd)
             if result:

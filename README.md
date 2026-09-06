@@ -161,7 +161,7 @@ convention (`actions.py`):
 | Block | Effect | Confirmed? | Fed back to the model? |
 |---|---|---|---|
 | ` ```write:path ` | create/replace a file; preserves the existing file's CRLF/LF and UTF-8 BOM, refuses a non-UTF-8 target, shows a unified diff (capped at 200 lines) before overwriting, and skips silently when the content is already identical | yes, y/N | no |
-| ` ```edit:path ` | replace one unique snippet (`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`); matches LF snippets against LF or CRLF text, preserves all bytes outside the splice plus any UTF-8 BOM, refuses non-UTF-8 files and 0 or 2+ total matches, and shows a capped unified diff before y/N | yes, y/N | **only on failure** (structured ERROR block, up to 2 hops) |
+| ` ```edit:path ` | replace one unique snippet (`<<<<<<< SEARCH` / `=======` / `>>>>>>> REPLACE`); matches LF snippets against LF or CRLF text, preserves all bytes outside the splice plus any UTF-8 BOM, refuses non-UTF-8 files and 0 or 2+ total matches, and shows a capped unified diff before y/N | yes, y/N | **on failure *and* on a malformed fence** (structured ERROR block, up to 2 hops) |
 | ` ```delete:path ` | remove a file | yes, y/N | no |
 | ` ```run ` | execute a shell command | yes, y/N, plus a denylist that refuses catastrophic patterns without even prompting | yes, up to 2 hops |
 | ` ```fetch:url ` | fetch a web page as text | yes, y/N, http(s) only, skipped immediately if offline | yes, up to 2 hops |
@@ -402,6 +402,9 @@ has no thinking-mode branch at all, so this doesn't affect the default.
 
 ## Security
 
+- EOF on stdin is treated as "no" at every confirmation prompt
+  (`ui.confirm`), so a piped or non-interactive run can never auto-approve
+  and can never die with a traceback halfway through a turn.
 - **Model-emitted mutations can never touch git internals or credential
   files:** `pathpolicy.resolve_for_mutation()` is the single gate all three
   mutating actions call, so there is no second code path to keep in sync.

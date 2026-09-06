@@ -109,6 +109,24 @@ def extract_edits(model_output: str) -> list[FileEdit]:
     return out
 
 
+@dataclass
+class MalformedEdit:
+    path: str
+    body: str
+
+
+def extract_malformed_edits(model_output: str) -> list[MalformedEdit]:
+    """The exact complement of extract_edits: every `edit` fence whose body
+    is not a well-formed SEARCH/REPLACE pair. These used to be dropped
+    silently, so the turn simply ended with nothing applied and nothing
+    said; run_turn now feeds each one back as a structured ERROR."""
+    return [
+        MalformedEdit(path=m.group(2).strip(), body=m.group(3))
+        for m in EDIT_BLOCK_RE.finditer(model_output)
+        if EDIT_BODY_RE.search(m.group(3)) is None
+    ]
+
+
 def extract_deletes(model_output: str) -> list[str]:
     return [m.group(2).strip() for m in DELETE_BLOCK_RE.finditer(model_output)]
 

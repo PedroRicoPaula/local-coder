@@ -106,6 +106,33 @@ class TestExtraction(unittest.TestCase):
         self.assertNotIn("<<<<<<< SEARCH", prose)
 
 
+class TestExtractMalformedEdits(unittest.TestCase):
+    def test_finds_the_fence_extract_edits_skips(self):
+        text = "```edit:calc.py\njust some text without markers\n```"
+        self.assertEqual(actions.extract_edits(text), [])
+        malformed = actions.extract_malformed_edits(text)
+        self.assertEqual(len(malformed), 1)
+        self.assertEqual(malformed[0].path, "calc.py")
+        self.assertIn("without markers", malformed[0].body)
+
+    def test_a_well_formed_fence_is_not_reported_as_malformed(self):
+        text = (
+            "```edit:calc.py\n"
+            "<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n"
+            "```"
+        )
+        self.assertEqual(actions.extract_malformed_edits(text), [])
+        self.assertEqual(len(actions.extract_edits(text)), 1)
+
+    def test_mixed_output_splits_correctly(self):
+        text = (
+            "```edit:good.py\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n```\n"
+            "```edit:bad.py\nnope\n```"
+        )
+        self.assertEqual([e.path for e in actions.extract_edits(text)], ["good.py"])
+        self.assertEqual([m.path for m in actions.extract_malformed_edits(text)], ["bad.py"])
+
+
 class TestFormatActionError(unittest.TestCase):
     def test_error_block_is_structured_for_a_small_model(self):
         msg = actions.format_action_error(
