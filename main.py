@@ -19,6 +19,7 @@ import config
 import execution
 import gitsafety
 import ui
+import verification
 import webfetch
 import websearch
 from agents.base import Agent
@@ -36,6 +37,9 @@ from llm.ollama_client import OllamaClient, OllamaError, Usage
 from llm.prompts import build_user_prompt
 
 MAX_FOLLOWUP_TURNS = 2
+MAX_REPAIR_HOPS = 1  # NOT configurable: this is the one bound preventing an
+                     # unbounded fix/verify loop, and there is no evidence a
+                     # second hop helps a 7B model.
 NEAR_LIMIT_FRACTION = 0.98  # prompt_eval_count / num_ctx above this -> warn
 
 BANNER = """localcoder -- local, offline coding assistant (qwen2.5-coder via Ollama)
@@ -274,6 +278,21 @@ def _apply_blocks(output: str, project_root: str, cce: CCEClient,
     return action_results
 
 
+def build_verify_config(cfg: dict) -> verification.VerifyConfig:
+    override = cfg.get("verify_command")
+    if override is not None and not (
+        isinstance(override, list) and override
+        and all(isinstance(part, str) for part in override)
+    ):
+        ui.warn("verify_command must be a list of strings -- ignoring it")
+        override = None
+    return verification.VerifyConfig(
+        enabled=bool(cfg.get("verify_after_change", True)),
+        timeout_s=int(cfg.get("verify_timeout_s", 180)),
+        override_argv=list(override) if override else None,
+    )
+
+
 def run_turn(
     agent: Agent,
     task: str,
@@ -283,6 +302,7 @@ def run_turn(
     num_ctx: int,
     max_total_context_chars: int,
     initial_kv_context: list[int] | None = None,
+    verify: verification.VerifyConfig | None = None,
 ) -> list[int] | None:
     """Streams a response, applies every action block it contains, and --
     only if a ```run/```fetch/```search/```symbol produced output, or an
@@ -309,9 +329,16 @@ def run_turn(
     the no-cache fallback path use.
 
     Returns the final KV context array (or None) so the caller can offer it
-    to the *next* run_turn() call, if it wants to."""
+    to the *next* run_turn() call, if it wants to.
+
+    `verify` enables the post-mutation verification phase; None means "no
+    verification", which is exactly the pre-existing behaviour. Verification
+    runs once, after the exploration loop -- never between hops, because
+    running the suite mid-change tests a half-finished edit and multiplies
+    the cost on hardware where each execution is real wall time."""
     current_task = task
     hop_kv_context = initial_kv_context
+    mutated: list[str] = []
     for hop in range(MAX_FOLLOWUP_TURNS + 1):
         if hop == 0:
             # Start of a new task: current_task IS the new content (there's
@@ -341,18 +368,46 @@ def run_turn(
 
         print_usage_summary(usage, num_ctx)
 
-        mutated_this_hop: list[str] = []
-        action_results = _apply_blocks(output, project_root, cce, mutated_this_hop)
-
+        action_results = _apply_blocks(output, project_root, cce, mutated)
         if not action_results:
-            return hop_kv_context
+            break
         if hop >= MAX_FOLLOWUP_TURNS:
             ui.info(f"follow-up limit reached ({MAX_FOLLOWUP_TURNS}) -- stopping here")
-            return hop_kv_context
-
+            break
         current_task, appended, hop_kv_context = _append_result(
             task, current_task, action_results, max_total_context_chars, num_ctx, hop_kv_context,
         )
+
+    if verify is None or not mutated:
+        return hop_kv_context
+
+    outcome = verification.verify_project(project_root, mutated, verify)
+    if not outcome.needs_repair:
+        return hop_kv_context
+
+    current_task, delta, hop_kv_context = _append_result(
+        task, current_task, [verification.failure_feedback(outcome)],
+        max_total_context_chars, num_ctx, hop_kv_context,
+    )
+    prompt, ctx = (delta, "") if hop_kv_context is not None else (current_task, context)
+    try:
+        output, usage, hop_kv_context = stream_and_print(
+            agent.run_stream(prompt, ctx, kv_context=hop_kv_context)
+        )
+    except OllamaError as e:
+        ui.error(str(e))
+        return hop_kv_context
+    print_usage_summary(usage, num_ctx)
+
+    repair_mutated: list[str] = []
+    # Every repair block is still applied and still individually confirmed
+    # (a ```run in the repair response executes if the human says yes), but
+    # the returned action results are DISCARDED -- that is what makes the
+    # model-call bound structural rather than arithmetic.
+    _apply_blocks(output, project_root, cce, repair_mutated)
+    if repair_mutated:
+        # Reported to the human by verify_project; never fed back anywhere.
+        verification.verify_project(project_root, repair_mutated, verify)
     return hop_kv_context
 
 
@@ -401,6 +456,8 @@ def main() -> None:
             f"{derived_budget} chars a ~{config.CHARS_PER_TOKEN} chars/token) -- o Ollama "
             f"pode descartar silenciosamente o início do prompt."
         )
+
+    verify_cfg = build_verify_config(cfg)
 
     cce = CCEClient(cfg["cce_binary"], project_root)
     if cce.start():
@@ -492,7 +549,7 @@ def main() -> None:
         with busy.held():
             return run_turn(
                 agent, task, ctx, project_root, cce, cfg["num_ctx"], cfg["max_total_context_chars"],
-                initial_kv_context=initial_kv_context,
+                initial_kv_context=initial_kv_context, verify=verify_cfg,
             )
 
     try:

@@ -1,9 +1,12 @@
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import main
+import verification
 from context.truncate import truncate_text
 from llm.ollama_client import Usage
 
@@ -388,6 +391,187 @@ class TestApplyBlocksHelper(unittest.TestCase):
                 main._apply_blocks("```write:new.py\nx\n```", root,
                                    _FakeCCE(available=False), mutated)
             self.assertEqual(mutated, [])
+
+
+def _write_chunk(context, path="calc.py", body="x = 1\n"):
+    chunk = {
+        "response": f"```write:{path}\n{body}```",
+        "done": True, "prompt_eval_count": 1, "eval_count": 1,
+    }
+    if context is not None:
+        chunk["context"] = context
+    return chunk
+
+
+def _outcome(needs_repair, feedback="--- VERIFICATION FAILED AFTER YOUR CHANGE ---\nboom"):
+    """A minimal stand-in for verification.VerificationOutcome."""
+    return mock.Mock(ran=True, needs_repair=needs_repair, skip_reason="", _feedback=feedback)
+
+
+class TestBuildVerifyConfig(unittest.TestCase):
+    def test_defaults(self):
+        cfg = main.build_verify_config(
+            {"verify_after_change": True, "verify_timeout_s": 180, "verify_command": None}
+        )
+        self.assertTrue(cfg.enabled)
+        self.assertEqual(cfg.timeout_s, 180)
+        self.assertIsNone(cfg.override_argv)
+
+    def test_valid_override(self):
+        cfg = main.build_verify_config({"verify_command": ["make", "check"]})
+        self.assertEqual(cfg.override_argv, ["make", "check"])
+
+    def test_invalid_override_is_warned_and_ignored(self):
+        buffer = io.StringIO()
+        with mock.patch("ui._enabled", return_value=False), \
+             contextlib.redirect_stdout(buffer):
+            cfg = main.build_verify_config({"verify_command": "make check"})
+        self.assertIsNone(cfg.override_argv)
+        self.assertIn("verify_command must be a list of strings", buffer.getvalue())
+
+    def test_empty_list_override_is_also_rejected(self):
+        with mock.patch("ui._enabled", return_value=False):
+            self.assertIsNone(main.build_verify_config({"verify_command": []}).override_argv)
+
+
+class TestVerificationRepairLifecycle(unittest.TestCase):
+    """The model-call and verification-execution bounds from the design's
+    §7.8 table, asserted exactly."""
+
+    def _run(self, agent, root, verify_side_effect):
+        with mock.patch("ui._enabled", return_value=False), \
+             mock.patch("builtins.input", return_value="y"), \
+             mock.patch("verification.verify_project",
+                        side_effect=verify_side_effect) as verify_project, \
+             mock.patch("verification.failure_feedback",
+                        side_effect=lambda outcome: outcome._feedback):
+            main.run_turn(
+                agent, "task", "", root, _FakeCCE(available=False),
+                num_ctx=8192, max_total_context_chars=100_000,
+                verify=verification.VerifyConfig(enabled=True, timeout_s=180, override_argv=None),
+            )
+        return verify_project
+
+    def test_no_mutation_never_calls_verify_project(self):
+        agent = _FakeAgent([[_final_chunk([1])]])
+        with tempfile.TemporaryDirectory() as root:
+            verify_project = self._run(agent, root, [])
+        self.assertEqual(len(agent.calls), 1)
+        verify_project.assert_not_called()
+
+    def test_mutation_plus_passing_verification_costs_no_extra_model_call(self):
+        agent = _FakeAgent([[_write_chunk([1])]])
+        with tempfile.TemporaryDirectory() as root:
+            verify_project = self._run(agent, root, [_outcome(False)])
+        self.assertEqual(len(agent.calls), 1)
+        self.assertEqual(verify_project.call_count, 1)
+        self.assertNotIn("VERIFICATION FAILED", agent.calls[0][0])
+
+    def test_failing_verification_costs_exactly_one_repair_call(self):
+        agent = _FakeAgent([[_write_chunk([1])], [_write_chunk([2], body="x = 2\n")]])
+        with tempfile.TemporaryDirectory() as root:
+            verify_project = self._run(agent, root, [_outcome(True), _outcome(False)])
+        self.assertEqual(len(agent.calls), 2)
+        self.assertIn("VERIFICATION FAILED", agent.calls[1][0])
+        self.assertIn("boom", agent.calls[1][0])
+        self.assertEqual(verify_project.call_count, 2)
+
+    def test_repair_that_mutates_nothing_skips_the_final_verification(self):
+        agent = _FakeAgent([[_write_chunk([1])], [_final_chunk([2])]])
+        with tempfile.TemporaryDirectory() as root:
+            verify_project = self._run(agent, root, [_outcome(True)])
+        self.assertEqual(len(agent.calls), 2)
+        self.assertEqual(verify_project.call_count, 1)
+
+    def test_a_run_block_in_the_repair_response_executes_but_starts_no_third_call(self):
+        repair = {
+            "response": "```run\necho repairing\n```",
+            "done": True, "prompt_eval_count": 1, "eval_count": 1, "context": [2],
+        }
+        agent = _FakeAgent([[_write_chunk([1])], [repair]])
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("execution.apply_run", return_value="$ echo\n(exit 0)\n") as run:
+                verify_project = self._run(agent, root, [_outcome(True)])
+            run.assert_called_once()
+        self.assertEqual(len(agent.calls), 2)
+        self.assertEqual(verify_project.call_count, 1)
+
+    def test_declined_verification_produces_no_repair(self):
+        declined = mock.Mock(ran=False, needs_repair=False, skip_reason="verification declined")
+        agent = _FakeAgent([[_write_chunk([1])]])
+        with tempfile.TemporaryDirectory() as root:
+            self._run(agent, root, [declined])
+        self.assertEqual(len(agent.calls), 1)
+
+    def test_two_exploration_hops_plus_failing_verification_is_exactly_four_calls(self):
+        agent = _FakeAgent([
+            [_symbol_chunk([1])],
+            [_symbol_chunk([2])],
+            [_write_chunk([3])],
+            [_final_chunk([4])],
+        ])
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("ui._enabled", return_value=False), \
+                 mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("verification.verify_project",
+                            side_effect=[_outcome(True)]), \
+                 mock.patch("verification.failure_feedback",
+                            side_effect=lambda outcome: outcome._feedback):
+                main.run_turn(
+                    agent, "task", "", root,
+                    _FakeCCE(available=True, symbol_result="def foo(): ..."),
+                    num_ctx=8192, max_total_context_chars=100_000,
+                    verify=verification.VerifyConfig(
+                        enabled=True, timeout_s=180, override_argv=None),
+                )
+        self.assertEqual(len(agent.calls), 4)
+
+    def test_repair_call_reuses_the_previous_hop_kv_context_and_sends_the_delta_only(self):
+        agent = _FakeAgent([[_write_chunk([100, 101])], [_final_chunk([200])]])
+        with tempfile.TemporaryDirectory() as root:
+            self._run(agent, root, [_outcome(True)])
+        repair_task, repair_ctx, repair_kv = agent.calls[1]
+        self.assertEqual(repair_kv, [100, 101])
+        self.assertEqual(repair_ctx, "")
+        self.assertIn("VERIFICATION FAILED", repair_task)
+        self.assertNotIn("task\n\n--- RESULT", repair_task)
+
+    def test_repair_call_falls_back_to_a_full_resend_after_the_drop_history_branch(self):
+        agent = _FakeAgent([[_write_chunk([100])], [_final_chunk([200])]])
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("ui._enabled", return_value=False), \
+                 mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("verification.verify_project", side_effect=[_outcome(True)]), \
+                 mock.patch("verification.failure_feedback",
+                            side_effect=lambda outcome: outcome._feedback):
+                main.run_turn(
+                    agent, "task", "FILECTX", root, _FakeCCE(available=False),
+                    num_ctx=8192, max_total_context_chars=120,  # < appended (~141) so history drops; > 2*feedback so the marker survives truncate_text
+                    verify=verification.VerifyConfig(
+                        enabled=True, timeout_s=180, override_argv=None),
+                )
+        repair_task, repair_ctx, repair_kv = agent.calls[1]
+        self.assertIsNone(repair_kv)
+        self.assertEqual(repair_ctx, "FILECTX")
+        self.assertIn("VERIFICATION FAILED", repair_task)
+
+    def test_verify_none_reproduces_todays_behaviour(self):
+        agent = _FakeAgent([[_write_chunk([1])]])
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("ui._enabled", return_value=False), \
+                 mock.patch("builtins.input", return_value="y"), \
+                 mock.patch("verification.verify_project",
+                            side_effect=AssertionError("must not be called")):
+                main.run_turn(
+                    agent, "task", "", root, _FakeCCE(available=False),
+                    num_ctx=8192, max_total_context_chars=100_000,
+                )
+        self.assertEqual(len(agent.calls), 1)
+
+
+class TestRepairBound(unittest.TestCase):
+    def test_max_repair_hops_is_one(self):
+        self.assertEqual(main.MAX_REPAIR_HOPS, 1)
 
 
 if __name__ == "__main__":
