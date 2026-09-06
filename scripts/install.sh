@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Sets up localcoder on a Linux machine: detects this machine's hardware,
-# writes a config.json tuned for it, installs the Ollama systemd --user
-# service (symlinked to this repo's tuning script, not copied -- so future
-# repo changes take effect without re-running this), and installs a
-# `localcoder` launcher on PATH. Safe to re-run: never overwrites a
-# config.json that already exists, and the systemd unit / launcher are
-# idempotent (same content every time).
-#
-# Linux only, by design -- see docs/BACKLOG.md for why macOS isn't covered.
+# Sets up localcoder: detects this machine's hardware, writes a config.json
+# tuned for it (never overwrites an existing one), and installs a
+# `localcoder` launcher on PATH. On Linux + systemd, also installs the
+# Ollama systemd --user service (symlinked to this repo's tuning script,
+# not copied). On macOS (or Linux without systemd) the launcher is still
+# installed; Ollama.app / a manual scripts/ollama-serve-tuned.sh is used
+# instead of a second server. See
+# docs/superpowers/specs/2026-09-06-macos-support-design.md.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,13 +19,6 @@ echo "localcoder install -- repo: $REPO_ROOT"
 command -v python3 >/dev/null 2>&1 || { echo "python3 not found -- install it first."; exit 1; }
 if ! command -v ollama >/dev/null 2>&1; then
     echo "ollama not found on PATH -- install it first: https://ollama.com/download"
-    exit 1
-fi
-if ! command -v systemctl >/dev/null 2>&1; then
-    echo "systemctl not found -- this install script only automates the systemd --user path."
-    echo "You can still run localcoder manually: start 'ollama serve' yourself"
-    echo "(or run scripts/ollama-serve-tuned.sh directly), then use main.py."
-    echo "See scripts/ollama-serve-tuned.sh's comments for the env vars it sets and why."
     exit 1
 fi
 
@@ -94,16 +86,24 @@ print(f"wrote {path}")
 PYEOF
 fi
 
-# --- 4. Ollama systemd --user service, symlinked to the repo's script --
-mkdir -p "$LOCAL_BIN" "$SYSTEMD_USER_DIR"
-chmod +x "$REPO_ROOT/scripts/ollama-serve-tuned.sh"
-ln -sf "$REPO_ROOT/scripts/ollama-serve-tuned.sh" "$LOCAL_BIN/ollama-serve-tuned"
-echo "symlinked $LOCAL_BIN/ollama-serve-tuned -> repo's scripts/ollama-serve-tuned.sh"
-
-cp "$REPO_ROOT/scripts/ollama-tuned.service" "$SYSTEMD_USER_DIR/ollama-tuned.service"
-systemctl --user daemon-reload
-systemctl --user enable --now ollama-tuned.service
-echo "ollama-tuned.service enabled and started"
+# --- 4. Ollama service (Linux + systemd only) --------------------------
+if command -v systemctl >/dev/null 2>&1; then
+    mkdir -p "$LOCAL_BIN" "$SYSTEMD_USER_DIR"
+    chmod +x "$REPO_ROOT/scripts/ollama-serve-tuned.sh"
+    ln -sf "$REPO_ROOT/scripts/ollama-serve-tuned.sh" "$LOCAL_BIN/ollama-serve-tuned"
+    echo "symlinked $LOCAL_BIN/ollama-serve-tuned -> repo's scripts/ollama-serve-tuned.sh"
+    cp "$REPO_ROOT/scripts/ollama-tuned.service" "$SYSTEMD_USER_DIR/ollama-tuned.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now ollama-tuned.service
+    echo "ollama-tuned.service enabled and started"
+else
+    mkdir -p "$LOCAL_BIN"
+    chmod +x "$REPO_ROOT/scripts/ollama-serve-tuned.sh"
+    echo "no systemd -- skipping ollama-tuned.service (expected on macOS)."
+    echo "If Ollama.app is already running, use that. Otherwise start:"
+    echo "  $REPO_ROOT/scripts/ollama-serve-tuned.sh"
+    echo "in its own terminal (do not background it -- see README Troubleshooting)."
+fi
 
 # --- 5. `localcoder` launcher on PATH ----------------------------------
 cat > "$LOCAL_BIN/localcoder" <<EOF
@@ -117,8 +117,15 @@ case ":$PATH:" in
     *":$LOCAL_BIN:"*) ;;
     *) echo "NOTE: $LOCAL_BIN is not on your PATH -- add it in your shell's rc file:"
        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+       echo "On macOS zsh (default), that line belongs in ~/.zprofile."
        ;;
 esac
+
+if python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11434/api/version', timeout=2)" 2>/dev/null; then
+    echo "Ollama is already answering on 127.0.0.1:11434 -- using that (do not start a second server)."
+else
+    echo "Ollama is not answering on 127.0.0.1:11434 yet. Open Ollama.app or run scripts/ollama-serve-tuned.sh, then: ollama pull qwen2.5-coder:7b"
+fi
 
 echo ""
 echo "Done. Run 'localcoder' from inside a project directory to start."

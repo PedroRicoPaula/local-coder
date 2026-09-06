@@ -51,12 +51,55 @@ class TestDeniedPatterns(unittest.TestCase):
 
 
 def _dead_or_zombie(pid: int) -> bool:
-    """Return whether a Linux process is gone or awaiting parent reaping."""
+    """True if pid is gone or a zombie (Linux /proc or POSIX ps)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
     try:
         with open(f"/proc/{pid}/stat") as handle:
             return handle.read().rsplit(") ", 1)[1].split()[0] == "Z"
     except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if out.returncode != 0 or not out.stdout.strip():
         return True
+    return out.stdout.strip().upper().startswith("Z")
+
+
+class TestDeadOrZombie(unittest.TestCase):
+    def test_process_lookup_error_is_dead(self):
+        with mock.patch("os.kill", side_effect=ProcessLookupError):
+            self.assertTrue(_dead_or_zombie(999999))
+
+    def test_linux_zombie_stat_is_dead(self):
+        with mock.patch("os.kill", return_value=None), mock.patch(
+            "builtins.open", mock.mock_open(read_data="123 (sleep) Z 1")
+        ):
+            self.assertTrue(_dead_or_zombie(123))
+
+    def test_alive_without_proc_uses_ps_state(self):
+        ps = mock.Mock(returncode=0, stdout="S\n")
+        with mock.patch("os.kill", return_value=None), mock.patch(
+            "builtins.open", side_effect=OSError
+        ), mock.patch("subprocess.run", return_value=ps) as run:
+            self.assertFalse(_dead_or_zombie(123))
+            run.assert_called()
+
+    def test_ps_zombie_or_missing_pid_is_dead(self):
+        missing = mock.Mock(returncode=1, stdout="")
+        with mock.patch("os.kill", return_value=None), mock.patch(
+            "builtins.open", side_effect=OSError
+        ), mock.patch("subprocess.run", return_value=missing):
+            self.assertTrue(_dead_or_zombie(123))
 
 
 class TestRunArgv(unittest.TestCase):

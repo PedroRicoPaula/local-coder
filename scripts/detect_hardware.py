@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Detects this Linux machine's CPU/RAM/GPU capability and buckets it into
-a tier, so install.sh can write a config.json and Ollama tuning suited to
-THIS machine instead of hand-copying settings tuned for a different one
-(which is exactly how localcoder ended up working only on its original dev
-machine -- see docs/BACKLOG.md). Stdlib only, matching the rest of this
-project.
+"""Detects this machine's CPU/RAM/GPU capability (Linux and macOS) and
+buckets it into a tier, so install.sh can write a config.json and Ollama
+tuning suited to THIS machine instead of hand-copying settings tuned for a
+different one (which is exactly how localcoder ended up working only on
+its original dev machine -- see docs/BACKLOG.md). Stdlib only, matching
+the rest of this project.
 
 Structurally similar to what tools like whichllm/llmfit do (detect
 hardware, pick a tier) -- the Ollama-tuning-per-tier part below is
@@ -32,17 +32,35 @@ class Hardware:
     tier: str  # "gpu" | "cpu-strong" | "cpu-weak"
 
 
+def _sysctl_int(name: str) -> int | None:
+    if not shutil.which("sysctl"):
+        return None
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        return int(out.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _physical_cores() -> int:
     """Counts unique (physical id, core id) pairs in /proc/cpuinfo --
     logical (hyperthreaded) siblings share a core id, so this correctly
-    undercounts them relative to os.cpu_count(). Falls back to
-    os.cpu_count() if /proc/cpuinfo is unreadable (non-Linux, restricted
-    container) or doesn't expose these fields (unusual, but this must
-    never raise -- a wrong tier guess is recoverable, a crash isn't)."""
+    undercounts them relative to os.cpu_count(). Falls back to Darwin
+    `sysctl hw.physicalcpu`, then os.cpu_count(), if /proc/cpuinfo is
+    unreadable. This must never raise -- a wrong tier guess is
+    recoverable, a crash isn't."""
     try:
         text = Path("/proc/cpuinfo").read_text()
     except OSError:
-        return os.cpu_count() or 1
+        return _sysctl_int("hw.physicalcpu") or (os.cpu_count() or 1)
     pairs: set[tuple[str, str]] = set()
     physical_id = "0"  # some CPUs omit "physical id" entirely (single-socket, always 0)
     for line in text.splitlines():
@@ -57,7 +75,8 @@ def _ram_gb() -> float:
     try:
         text = Path("/proc/meminfo").read_text()
     except OSError:
-        return 0.0
+        nbytes = _sysctl_int("hw.memsize")
+        return nbytes / 1024 / 1024 / 1024 if nbytes else 0.0
     for line in text.splitlines():
         if line.startswith("MemTotal:"):
             kb = int(line.split()[1])
@@ -66,27 +85,28 @@ def _ram_gb() -> float:
 
 
 def _gpu() -> tuple[bool, float | None]:
-    """Only recognizes an NVIDIA GPU with a working driver (nvidia-smi
-    actually runs) -- an unsupported/driverless card (as found on this
-    reference machine: an old GeForce 920M with no driver installed) is
-    correctly reported as no usable GPU, since that's what Ollama itself
-    will see too."""
-    if not shutil.which("nvidia-smi"):
-        return False, None
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False, None
-    if out.returncode != 0 or not out.stdout.strip():
-        return False, None
-    try:
-        vram_mb = float(out.stdout.strip().splitlines()[0])
-    except ValueError:
+    """NVIDIA via nvidia-smi when the driver actually works; Apple Silicon
+    (arm64) via Metal, which Ollama uses without extra flags. A
+    driverless NVIDIA card (this reference machine's 920M) and an Intel
+    Mac without nvidia-smi both count as no GPU."""
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            out = None
+        else:
+            if out.returncode == 0 and out.stdout.strip():
+                try:
+                    vram_mb = float(out.stdout.strip().splitlines()[0])
+                except ValueError:
+                    return True, None
+                return True, vram_mb / 1024
+    if getattr(os.uname(), "machine", "") == "arm64":
         return True, None
-    return True, vram_mb / 1024
+    return False, None
 
 
 def _tier(physical_cores: int, ram_gb: float, has_gpu: bool) -> str:

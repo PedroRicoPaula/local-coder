@@ -5,7 +5,7 @@ A 100% local, offline coding CLI: `qwen2.5-coder:7b` via Ollama, with the
 doing context compression before anything reaches the model. Zero pip
 dependencies (stdlib only) — nothing here needs internet access at run time.
 
-## Quick start (Omarchy / any Linux with Ollama installed)
+## Quick start (Linux or macOS, with Ollama installed)
 
 ```bash
 git clone https://github.com/PedroRicoPaula/local-coder.git
@@ -15,14 +15,23 @@ cd local-coder
 # pulled -- install.sh doesn't do either, it only configures what's there.
 ollama pull qwen2.5-coder:7b     # skip if you already have it
 
-# 2. Detects this machine's CPU/RAM/GPU, writes a config.json tuned for it,
-# installs scripts/ollama-serve-tuned.sh as a systemd --user service (see
-# "Ollama tuning" below for why a service, not a backgrounded script), and
-# puts a `localcoder` launcher on PATH. Safe to re-run -- never overwrites
-# an existing config.json. Linux + systemd only (see docs/BACKLOG.md); on
-# anything else, run the steps inside scripts/install.sh by hand.
+# 2. Detects this machine's CPU/RAM/GPU, writes a config.json tuned for it
+# (never overwrites an existing one), and puts a `localcoder` launcher on
+# PATH. On Linux + systemd it also installs ollama-tuned.service (see
+# "Ollama tuning" below). On macOS it skips systemd and uses Ollama.app
+# if something is already answering on :11434 -- it will not start a
+# second server.
 ./scripts/install.sh
+```
 
+On macOS, if `~/.local/bin` is not on `PATH` (default zsh):
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile
+source ~/.zprofile
+```
+
+```bash
 # 3. Build the CCE binary once (optional but recommended -- see below)
 git clone https://github.com/PedroRicoPaula/Context-Compress-Engine.git ../Context-Compress-Engine
 cd ../Context-Compress-Engine
@@ -333,8 +342,9 @@ scripts/
                                       install.sh symlinks ~/.local/bin/ to this, not a copy)
   ollama-tuned.service                 systemd --user unit for the above
   detect_hardware.py                    CPU/RAM/GPU detection -> tier, stdlib only
-  install.sh                              hardware-tiered setup: config.json, systemd
-                                          service, `localcoder` launcher on PATH
+  install.sh                              hardware-tiered setup: config.json,
+                                          Linux systemd unit, `localcoder` launcher
+                                          (macOS: launcher only; no LaunchAgent)
   bench_ollama.py                         real tok/s + prefill benchmarking across models
 docs/
   BACKLOG.md                              open/done/deferred work, with reasoning
@@ -574,6 +584,12 @@ see `docs/LESSONS_LEARNED.md` for the full investigation):
    process (`kill <pid>`) or `systemctl --user restart ollama-tuned` to
    clear it -- the next request will pay a fresh model-load cost
    (`OLLAMA_KEEP_ALIVE`, ~15-20s) but won't be stuck behind the old one.
+   On macOS, if Ollama.app is already bound to `:11434`, do **not** also
+   start `scripts/ollama-serve-tuned.sh`. Restart the app (quit from the
+   menu bar, reopen) to clear an orphan. Tuned env vars are optional on
+   Apple Silicon -- Metal already applies; `launchctl setenv` + relaunch
+   the app only if you want the same `OLLAMA_KV_CACHE_TYPE` / keep-alive
+   values the Linux service sets.
 
 ## Limitations (measured on this hardware, not assumed)
 
