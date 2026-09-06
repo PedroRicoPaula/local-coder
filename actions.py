@@ -273,7 +273,11 @@ def apply_delete(project_root: str, path: str, confirm: bool = True) -> bool:
             ui.sub(f"skipped {rel}")
             return False
 
-    target.unlink()
+    try:
+        target.unlink()
+    except OSError as e:
+        ui.error(f"could not delete {rel}: {e}")
+        return False
     ui.sub(f"deleted {rel}")
     gitsafety.commit_change(project_root, f"delete {rel}", [rel])
     return True
@@ -306,7 +310,33 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
             ),
         )
 
-    original = target.read_text(errors="replace")
+    try:
+        current = textfile.read(target)
+    except UnicodeDecodeError:
+        ui.error(f"edit {rel}: file is not valid UTF-8")
+        return EditResult(
+            False,
+            format_action_error(
+                action="edit",
+                reason="file is not valid UTF-8 -- refusing to edit it",
+                path=edit.path,
+                suggestion="this file is not text localcoder can safely edit",
+            ),
+        )
+    except OSError as e:
+        ui.error(f"edit {rel}: could not read the file: {e}")
+        return EditResult(
+            False,
+            format_action_error(
+                action="edit",
+                reason=f"could not read the file: {e}",
+                path=edit.path,
+                suggestion="check the file's permissions and retry",
+            ),
+        )
+
+    # Empty search is checked BEFORE counting: str.count("") returns
+    # len(text) + 1, not 0 (docs/LESSONS_LEARNED.md).
     if not edit.search:
         ui.error(f"edit {rel}: empty search block")
         return EditResult(
@@ -318,9 +348,16 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
                 suggestion="include the exact snippet to replace between SEARCH and =======",
             ),
         )
-    matches = original.count(edit.search)
-    if matches != 1:
-        reason = f"search block matched {matches} times (need exactly 1)"
+
+    raw = current.text
+    candidates = [edit.search]
+    crlf_search = edit.search.replace("\n", "\r\n")
+    if crlf_search != edit.search:
+        candidates.append(crlf_search)
+    counts = [raw.count(candidate) for candidate in candidates]
+    total = sum(counts)
+    if total != 1:
+        reason = f"search block matched {total} times (need exactly 1)"
         ui.error(f"edit {rel}: {reason}")
         return EditResult(
             False,
@@ -332,22 +369,53 @@ def apply_edit(project_root: str, edit: FileEdit, confirm: bool = True) -> EditR
             ),
         )
 
-    updated = original.replace(edit.search, edit.replace, 1)
+    needle = candidates[counts.index(1)]
+    replacement = edit.replace if needle == edit.search else edit.replace.replace("\n", "\r\n")
+    # Splicing the raw text leaves every byte outside the replaced region
+    # untouched -- CRLF, mixed EOLs and the BOM all survive by construction.
+    updated = raw.replace(needle, replacement, 1)
+
+    try:
+        textfile.encode_bytes(updated, bom=current.bom)
+    except UnicodeEncodeError:
+        ui.error(f"edit {rel}: replacement is not valid UTF-8")
+        return EditResult(
+            False,
+            format_action_error(
+                action="edit",
+                reason="replacement is not valid UTF-8 -- refusing to edit the file",
+                path=edit.path,
+                suggestion="retry without unpaired Unicode surrogate characters",
+            ),
+        )
+
     suspects = find_suspected_secrets(edit.replace)
     if suspects:
         ui.warn(f"{rel} edit contains something shaped like a secret: {suspects[0][:12]}...")
         ui.warn("this is a pattern-match warning, not a certainty -- check before confirming.")
 
-    diff = unified_diff(rel, original, updated)
+    diff = unified_diff(rel, raw.replace("\r\n", "\n"), updated.replace("\r\n", "\n"))
     if diff:
-        ui.sub(diff.rstrip("\n"))
+        ui.sub(_cap_diff(diff).rstrip("\n"))
 
-    if confirm:
-        if not ui.confirm(f"  apply edit to {rel}?"):
-            ui.sub(f"skipped {rel}")
-            return EditResult(False)
+    if confirm and not ui.confirm(f"  apply edit to {rel}?"):
+        ui.sub(f"skipped {rel}")
+        return EditResult(False)
 
-    target.write_text(updated)
+    try:
+        textfile.write(target, updated, bom=current.bom)
+    except OSError as e:
+        ui.error(f"could not write {rel}: {e}")
+        return EditResult(
+            False,
+            format_action_error(
+                action="edit",
+                reason=f"could not write the file: {e}",
+                path=edit.path,
+                suggestion="check the file's permissions and retry",
+            ),
+        )
+
     ui.sub(f"edited {rel}")
     gitsafety.commit_change(project_root, f"edit {rel}", [rel])
     return EditResult(True)

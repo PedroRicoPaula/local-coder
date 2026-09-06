@@ -317,6 +317,142 @@ class TestApplyEdit(unittest.TestCase):
         self.assertIn("+new", diff)
 
 
+class TestApplyEditByteFidelity(unittest.TestCase):
+    def test_editing_one_line_of_a_crlf_file_keeps_every_other_crlf(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "win.py")
+            target.write_bytes(b"a = 1\r\nb = 2\r\nc = 3\r\n")
+            result = actions.apply_edit(
+                root,
+                actions.FileEdit(path="win.py", search="b = 2\n", replace="b = 22\n"),
+                confirm=False,
+            )
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(target.read_bytes(), b"a = 1\r\nb = 22\r\nc = 3\r\n")
+
+    def test_editing_a_bom_file_preserves_the_bom(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "bom.py")
+            target.write_bytes(b"\xef\xbb\xbfx = 1\n")
+            result = actions.apply_edit(
+                root,
+                actions.FileEdit(path="bom.py", search="x = 1\n", replace="x = 2\n"),
+                confirm=False,
+            )
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(target.read_bytes(), b"\xef\xbb\xbfx = 2\n")
+
+    def test_editing_a_non_utf8_file_is_refused_and_leaves_it_byte_identical(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "latin1.txt")
+            raw = b"caf\xe9\n"
+            target.write_bytes(raw)
+            result = actions.apply_edit(
+                root,
+                actions.FileEdit(path="latin1.txt", search="cafe", replace="coffee"),
+                confirm=False,
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("not valid UTF-8", result.error)
+            self.assertIn("ERROR:", result.error)
+            self.assertEqual(target.read_bytes(), raw)
+
+    def test_lf_search_matching_a_crlf_file_is_still_unique(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "win.py")
+            target.write_bytes(b"only = 1\r\n")
+            result = actions.apply_edit(
+                root,
+                actions.FileEdit(path="win.py", search="only = 1\n", replace="only = 2\n"),
+                confirm=False,
+            )
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(target.read_bytes(), b"only = 2\r\n")
+
+    def test_ambiguous_match_reports_total_across_lf_and_crlf_candidates(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "mixed.py")
+            raw = b"x = 1\nx = 1\r\n"
+            target.write_bytes(raw)
+            result = actions.apply_edit(
+                root,
+                actions.FileEdit(path="mixed.py", search="x = 1\n", replace="x = 2\n"),
+                confirm=False,
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("matched 2 times", result.error)
+            self.assertEqual(target.read_bytes(), raw)
+
+    def test_editing_mixed_eol_file_preserves_bytes_outside_splice(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "mixed.py")
+            target.write_bytes(b"lf = 1\ncrlf = 2\r\ntail = 3\n")
+            result = actions.apply_edit(
+                root,
+                actions.FileEdit(path="mixed.py", search="crlf = 2\n", replace="crlf = 22\n"),
+                confirm=False,
+            )
+            self.assertTrue(result.ok, result.error)
+            self.assertEqual(target.read_bytes(), b"lf = 1\ncrlf = 22\r\ntail = 3\n")
+
+    def test_surrogate_replacement_is_refused_before_touching_target(self):
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root, "safe.py")
+            raw = b"x = 1\n"
+            target.write_bytes(raw)
+            with mock.patch("builtins.input", side_effect=AssertionError("should never prompt")):
+                result = actions.apply_edit(
+                    root,
+                    actions.FileEdit(path="safe.py", search="1", replace="\ud800"),
+                    confirm=True,
+                )
+            self.assertFalse(result.ok)
+            self.assertIn("not valid UTF-8", result.error)
+            self.assertEqual(target.read_bytes(), raw)
+
+
+class TestMutationOsErrorHandling(unittest.TestCase):
+    def test_write_reports_oserror_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("textfile.write", side_effect=OSError("disk on fire")):
+                ok = actions.apply_write(
+                    root, actions.FileWrite(path="a.py", content="x\n"), confirm=False
+                )
+            self.assertFalse(ok)
+
+    def test_edit_read_oserror_is_a_structured_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "a.py").write_text("x = 1\n")
+            with mock.patch("textfile.read", side_effect=OSError("read failed")):
+                result = actions.apply_edit(
+                    root,
+                    actions.FileEdit(path="a.py", search="x = 1\n", replace="x = 2\n"),
+                    confirm=False,
+                )
+            self.assertFalse(result.ok)
+            self.assertIn("ERROR:", result.error)
+            self.assertIn("read failed", result.error)
+
+    def test_edit_reports_oserror_as_a_structured_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "a.py").write_text("x = 1\n")
+            with mock.patch("textfile.write", side_effect=OSError("disk on fire")):
+                result = actions.apply_edit(
+                    root,
+                    actions.FileEdit(path="a.py", search="x = 1\n", replace="x = 2\n"),
+                    confirm=False,
+                )
+            self.assertFalse(result.ok)
+            self.assertIn("ERROR:", result.error)
+            self.assertIn("disk on fire", result.error)
+
+    def test_delete_reports_oserror_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "a.py").write_text("x\n")
+            with mock.patch("pathlib.Path.unlink", side_effect=OSError("busy")):
+                self.assertFalse(actions.apply_delete(root, "a.py", confirm=False))
+
+
 class TestMutationPathPolicy(unittest.TestCase):
     def test_write_refuses_git_internals(self):
         with tempfile.TemporaryDirectory() as root:

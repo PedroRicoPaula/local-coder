@@ -150,6 +150,21 @@ start.
 **Takeaway**: reject empty search *before* counting matches. The uniqueness
 gate only means something for a non-empty needle.
 
+## Text-mode reads cannot support byte-faithful edits
+
+**Symptom risk**: `Path.read_text()` uses universal-newline translation, so
+CRLF becomes LF before matching. Writing the edited string back then changes
+every line ending in the file even when the requested splice touched one line.
+Using `errors="replace"` also turns invalid bytes into replacement characters,
+and an unpaired surrogate can fail while rendering the diff or truncate a file
+if encoding happens after opening it for writing.
+
+**Takeaway**: mutation paths must decode strict UTF-8 without newline
+translation, splice the exact decoded text, preserve the BOM separately, and
+encode the complete result before showing a diff, prompting, or touching the
+target. EOL-tolerant matching should aggregate exact LF and rendered CRLF
+candidate counts without normalizing the whole file.
+
 ## `git revert`'s failure modes are three different things, and only one of them is abortable
 
 Measured directly (git 2.55.0, 2026-09-04) while designing the non-destructive
